@@ -13,7 +13,7 @@
 
 class Task {
 public:
-    Task(unsigned long long inst, Time_t arr, Time_t trgt, VMType_t vm, SLAType_t sla, CPUType_t cpu, bool gpu, unsigned mem, TaskClass_t task_class, TaskId_t id);
+    Task(uint64_t inst, Time_t arr, Time_t trgt, VMType_t vm, SLAType_t sla, CPUType_t cpu, bool gpu, unsigned mem, TaskClass_t task_class, TaskId_t id);
     TaskInfo_t GetInfo();
     
     TaskId_t GetId()                                            { return taskId; }
