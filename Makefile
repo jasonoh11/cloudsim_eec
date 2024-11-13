@@ -17,6 +17,10 @@ TARGET = simulator
 # Default target
 all: $(TARGET)
 
+# Default target
+scheduler: $(OBJ)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -o scheduler $(OBJ)
+
 # Build target
 $(TARGET): $(OBJ)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $(TARGET) $(OBJ)
