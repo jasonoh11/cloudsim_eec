@@ -14,6 +14,9 @@ OBJ = $(SRC:.cpp=.o)
 # Executable
 TARGET = simulator
 
+run-v:
+	./simulator -v 3 ./tmp/submitted_input
+
 # Default target
 all: $(TARGET)
 
@@ -28,7 +31,3 @@ $(TARGET): $(OBJ)
 # Compile source files into object files
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
-
-# Clean up build files
-clean:
-	rm -f $(OBJ) $(TARGET)

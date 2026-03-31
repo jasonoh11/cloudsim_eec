@@ -6,9 +6,39 @@
 //
 
 #include "Scheduler.hpp"
+#include <algorithm>
 
 static bool migrating = false;
-static unsigned active_machines = 16;
+static unsigned active_machines = 0;
+
+void Scheduler::PrintMachineBuckets() const {
+    for (unsigned cpu = 0; cpu < CPU_TYPE_COUNT; cpu++) {
+        string non_gpu_message = "CPU " + to_string(cpu) + " non-GPU machines:";
+        for (MachineId_t machine_id : non_gpu_machines_by_cpu[cpu]) {
+            non_gpu_message += " " + to_string(machine_id);
+        }
+        SimOutput(non_gpu_message, 2);
+
+        string gpu_message = "CPU " + to_string(cpu) + " GPU machines:";
+        for (MachineId_t machine_id : gpu_machines_by_cpu[cpu]) {
+            gpu_message += " " + to_string(machine_id);
+        }
+        SimOutput(gpu_message, 2);
+    }
+}
+
+float Scheduler::GetEfficiencyScore(MachineId_t machine_id) const {
+    MachineInfo_t info = Machine_GetInfo(machine_id);
+    return static_cast<float>(info.performance[P0]) / info.p_states[P0];
+
+}
+
+void Scheduler::SortByEfficiency(vector<MachineId_t>& machines) {
+    std::sort(machines.begin(), machines.end(),
+        [this](MachineId_t a, MachineId_t b) {
+            return GetEfficiencyScore(a) > GetEfficiencyScore(b);
+        });
+}
 
 void Scheduler::Init() {
     // Find the parameters of the clusters
@@ -18,28 +48,34 @@ void Scheduler::Init() {
     //      Get the memory of the machine
     //      Get the number of CPUs
     //      Get if there is a GPU or not
-    // 
-    SimOutput("Scheduler::Init(): Total number of machines is " + to_string(Machine_GetTotal()), 3);
+
+    active_machines = Machine_GetTotal();
+    SimOutput("Scheduler::Init(): Total number of machines is " + to_string(active_machines), 3);
     SimOutput("Scheduler::Init(): Initializing scheduler", 1);
-    for(unsigned i = 0; i < active_machines; i++)
-        vms.push_back(VM_Create(LINUX, X86));
+
     for(unsigned i = 0; i < active_machines; i++) {
-        machines.push_back(MachineId_t(i));
-    }    
-    for(unsigned i = 0; i < active_machines; i++) {
-        VM_Attach(vms[i], machines[i]);
+        MachineId_t machine_id = MachineId_t(i);
+        machines.push_back(machine_id);
+
+        MachineInfo_t info = Machine_GetInfo(machine_id);
+        unsigned cpu_index = static_cast<unsigned>(info.cpu);
+
+        if (info.gpus) {
+            gpu_machines_by_cpu[cpu_index].push_back(machine_id);
+        } else {
+            non_gpu_machines_by_cpu[cpu_index].push_back(machine_id);
+        }
     }
 
-    bool dynamic = false;
-    if(dynamic)
-        for(unsigned i = 0; i<4 ; i++)
-            for(unsigned j = 0; j < 8; j++)
-                Machine_SetCorePerformance(MachineId_t(0), j, P3);
-    // Turn off the ARM machines
-    for(unsigned i = 24; i < Machine_GetTotal(); i++)
-        Machine_SetState(MachineId_t(i), S5);
+    for(unsigned cpu = 0; cpu < CPU_TYPE_COUNT; cpu++){
+        SortByEfficiency(non_gpu_machines_by_cpu[cpu]);
+        SortByEfficiency(gpu_machines_by_cpu[cpu]);
+    }
 
-    SimOutput("Scheduler::Init(): VM ids are " + to_string(vms[0]) + " ahd " + to_string(vms[1]), 3);
+    SimOutput("Score " + to_string(GetEfficiencyScore(MachineId_t(0))), 1);
+    SimOutput("Score " + to_string(GetEfficiencyScore(MachineId_t(2))), 1);
+    PrintMachineBuckets();
+
 }
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
@@ -64,13 +100,14 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // Turn on a machine, migrate an existing VM from a loaded machine....
     //
     // Other possibilities as desired
-    Priority_t priority = (task_id == 0 || task_id == 64)? HIGH_PRIORITY : MID_PRIORITY;
-    if(migrating) {
-        VM_AddTask(vms[0], task_id, priority);
-    }
-    else {
-        VM_AddTask(vms[task_id % active_machines], task_id, priority);
-    }// Skeleton code, you need to change it according to your algorithm
+    VM_AddTask(vms[0], task_id, Priority_t(0));
+    // Priority_t priority = (task_id == 0 || task_id == 64)? HIGH_PRIORITY : MID_PRIORITY;
+    // if(migrating) {
+    //     VM_AddTask(vms[0], task_id, priority);
+    // }
+    // else {
+    //     VM_AddTask(vms[task_id % active_machines], task_id, priority);
+    // }// Skeleton code, you need to change it according to your algorithm
 }
 
 void Scheduler::PeriodicCheck(Time_t now) {
@@ -88,15 +125,15 @@ void Scheduler::Shutdown(Time_t time) {
     for(auto & vm: vms) {
         VM_Shutdown(vm);
     }
-    SimOutput("SimulationComplete(): Finished!", 4);
-    SimOutput("SimulationComplete(): Time is " + to_string(time), 4);
+    SimOutput("SimulationComplete(): Finished!", 3);
+    SimOutput("SimulationComplete(): Time is " + to_string(time), 3);
 }
 
 void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     // Do any bookkeeping necessary for the data structures
     // Decide if a machine is to be turned off, slowed down, or VMs to be migrated according to your policy
     // This is an opportunity to make any adjustments to optimize performance/energy
-    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " is complete at " + to_string(now), 4);
+    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " is complete at " + to_string(now), 3);
 }
 
 // Public interface below
@@ -104,17 +141,17 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
 static Scheduler Scheduler;
 
 void InitScheduler() {
-    SimOutput("InitScheduler(): Initializing scheduler", 4);
+    SimOutput("InitScheduler(): Initializing scheduler", 3);
     Scheduler.Init();
 }
 
 void HandleNewTask(Time_t time, TaskId_t task_id) {
-    SimOutput("HandleNewTask(): Received new task " + to_string(task_id) + " at time " + to_string(time), 4);
+    SimOutput("HandleNewTask(): Received new task " + to_string(task_id) + " at time " + to_string(time), 3);
     Scheduler.NewTask(time, task_id);
 }
 
 void HandleTaskCompletion(Time_t time, TaskId_t task_id) {
-    SimOutput("HandleTaskCompletion(): Task " + to_string(task_id) + " completed at time " + to_string(time), 4);
+    SimOutput("HandleTaskCompletion(): Task " + to_string(task_id) + " completed at time " + to_string(time), 3);
     Scheduler.TaskComplete(time, task_id);
 }
 
@@ -125,21 +162,21 @@ void MemoryWarning(Time_t time, MachineId_t machine_id) {
 
 void MigrationDone(Time_t time, VMId_t vm_id) {
     // The function is called on to alert you that migration is complete
-    SimOutput("MigrationDone(): Migration of VM " + to_string(vm_id) + " was completed at time " + to_string(time), 4);
+    SimOutput("MigrationDone(): Migration of VM " + to_string(vm_id) + " was completed at time " + to_string(time), 3);
     Scheduler.MigrationComplete(time, vm_id);
     migrating = false;
 }
 
 void SchedulerCheck(Time_t time) {
     // This function is called periodically by the simulator, no specific event
-    SimOutput("SchedulerCheck(): SchedulerCheck() called at " + to_string(time), 4);
+    SimOutput("SchedulerCheck(): SchedulerCheck() called at " + to_string(time), 3);
     Scheduler.PeriodicCheck(time);
-    static unsigned counts = 0;
-    counts++;
-    if(counts == 10) {
-        migrating = true;
-        VM_Migrate(1, 9);
-    }
+    // static unsigned counts = 0;
+    // counts++;
+    // if(counts == 10) {
+    //     migrating = true;
+    //     VM_Migrate(1, 9);
+    // }
 }
 
 void SimulationComplete(Time_t time) {
@@ -150,7 +187,7 @@ void SimulationComplete(Time_t time) {
     cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;     // SLA3 do not have SLA violation issues
     cout << "Total Energy " << Machine_GetClusterEnergy() << "KW-Hour" << endl;
     cout << "Simulation run finished in " << double(time)/1000000 << " seconds" << endl;
-    SimOutput("SimulationComplete(): Simulation finished at time " + to_string(time), 4);
+    SimOutput("SimulationComplete(): Simulation finished at time " + to_string(time), 3);
     
     Scheduler.Shutdown(time);
 }
@@ -162,4 +199,3 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
     // Called in response to an earlier request to change the state of a machine
 }
-
