@@ -28,7 +28,3 @@ $(TARGET): $(OBJ)
 # Compile source files into object files
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
-
-# Clean up build files
-clean:
-	rm -f $(OBJ) $(TARGET)
