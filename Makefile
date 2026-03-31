@@ -14,6 +14,10 @@ OBJ = $(SRC:.cpp=.o)
 # Executable
 TARGET = simulator
 
+# Run with verbose flag set to 3
+run-v:
+	./simulator -v 3 ./tmp/Input
+
 # Default target
 all: $(TARGET)
 
