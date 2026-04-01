@@ -8,6 +8,7 @@
 #ifndef Scheduler_hpp
 #define Scheduler_hpp
 
+#include <utility>
 #include <vector>
 
 #include "Interfaces.h"
@@ -26,11 +27,18 @@ private:
     float GetEfficiencyScore(MachineId_t) const;
     void SortByEfficiency(vector<MachineId_t>&);
     void PrintMachineBuckets() const;
+    pair<const vector<MachineId_t>*, const vector<MachineId_t>*> GetCandidateBuckets(TaskId_t task_id) const;
+    bool CanHostTask(MachineId_t machine_id, TaskId_t task_id) const;
+    MachineId_t FindFeasibleMachine(TaskId_t task_id) const;
+    bool VM_IsFeasible(VMId_t vm_id, TaskId_t task_id) const;
+    VMId_t FindFeasibleVM(MachineId_t machine_id, TaskId_t task_id) const;
 
     vector<VMId_t> vms;
     vector<MachineId_t> machines;
     vector<MachineId_t> gpu_machines_by_cpu[CPU_TYPE_COUNT];
     vector<MachineId_t> non_gpu_machines_by_cpu[CPU_TYPE_COUNT];
+    vector<vector<VMId_t>> machine_to_vms;
+    vector<bool> vm_is_migrating;
 };
 
 

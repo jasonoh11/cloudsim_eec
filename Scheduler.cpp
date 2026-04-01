@@ -40,6 +40,70 @@ void Scheduler::SortByEfficiency(vector<MachineId_t>& machines) {
         });
 }
 
+pair<const vector<MachineId_t>*, const vector<MachineId_t>*> Scheduler::GetCandidateBuckets(TaskId_t task_id) const {
+    TaskInfo_t info = GetTaskInfo(task_id);
+    unsigned cpu_index = static_cast<unsigned>(info.required_cpu);
+
+    if (info.gpu_capable) {
+        return {&gpu_machines_by_cpu[cpu_index], &non_gpu_machines_by_cpu[cpu_index]};
+    } else {
+        return {&non_gpu_machines_by_cpu[cpu_index], &gpu_machines_by_cpu[cpu_index]};
+    }
+}
+
+bool Scheduler::CanHostTask(MachineId_t machine_id, TaskId_t task_id) const {
+    MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+    TaskInfo_t task_info = GetTaskInfo(task_id);
+
+    if (machine_info.s_state != S0) {
+        return false;
+    }
+
+    unsigned free_memory = machine_info.memory_size - machine_info.memory_used;
+    unsigned required_memory = task_info.required_memory + VM_MEMORY_OVERHEAD;
+    return free_memory >= required_memory;
+}
+
+MachineId_t Scheduler::FindFeasibleMachine(TaskId_t task_id) const {
+    auto candidate_buckets = GetCandidateBuckets(task_id);
+    const vector<MachineId_t>* primary_candidates = candidate_buckets.first;
+    const vector<MachineId_t>* fallback_candidates = candidate_buckets.second;
+
+    for (MachineId_t machine_id : *primary_candidates) {
+        if (CanHostTask(machine_id, task_id)) {
+            return machine_id;
+        }
+    }
+
+    for (MachineId_t machine_id : *fallback_candidates) {
+        if (CanHostTask(machine_id, task_id)) {
+            return machine_id;
+        }
+    }
+
+    return Machine_GetTotal();
+}
+
+bool Scheduler::VM_IsFeasible(VMId_t vm_id, TaskId_t task_id) const {
+    VMInfo_t vm_info = VM_GetInfo(vm_id);
+    TaskInfo_t task_info = GetTaskInfo(task_id);
+
+    return (task_info.required_vm == vm_info.vm_type);
+}
+
+VMId_t Scheduler::FindFeasibleVM(MachineId_t machine_id, TaskId_t task_id) const {
+
+    for (VMId_t id : machine_to_vms[machine_id]) {
+        if (VM_IsFeasible(id, task_id)) {
+            return id;
+        }
+    }
+
+    return vms.size();
+}
+
+
+
 void Scheduler::Init() {
     // Find the parameters of the clusters
     // Get the total number of machines
@@ -52,6 +116,9 @@ void Scheduler::Init() {
     active_machines = Machine_GetTotal();
     SimOutput("Scheduler::Init(): Total number of machines is " + to_string(active_machines), 3);
     SimOutput("Scheduler::Init(): Initializing scheduler", 1);
+
+    machine_to_vms.resize(active_machines);
+
 
     for(unsigned i = 0; i < active_machines; i++) {
         MachineId_t machine_id = MachineId_t(i);
@@ -72,8 +139,6 @@ void Scheduler::Init() {
         SortByEfficiency(gpu_machines_by_cpu[cpu]);
     }
 
-    SimOutput("Score " + to_string(GetEfficiencyScore(MachineId_t(0))), 1);
-    SimOutput("Score " + to_string(GetEfficiencyScore(MachineId_t(2))), 1);
     PrintMachineBuckets();
 
 }
@@ -100,7 +165,6 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // Turn on a machine, migrate an existing VM from a loaded machine....
     //
     // Other possibilities as desired
-    VM_AddTask(vms[0], task_id, Priority_t(0));
     // Priority_t priority = (task_id == 0 || task_id == 64)? HIGH_PRIORITY : MID_PRIORITY;
     // if(migrating) {
     //     VM_AddTask(vms[0], task_id, priority);
@@ -108,6 +172,38 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // else {
     //     VM_AddTask(vms[task_id % active_machines], task_id, priority);
     // }// Skeleton code, you need to change it according to your algorithm
+    TaskInfo_t task_info = GetTaskInfo(task_id);
+
+    auto candidate_buckets = GetCandidateBuckets(task_id);
+    const vector<MachineId_t>* primary_candidates = candidate_buckets.first;
+    const vector<MachineId_t>* fallback_candidates = candidate_buckets.second;
+
+    string primary_message = "Primary candidates:";
+    for (MachineId_t id : *primary_candidates) {
+        primary_message += " " + to_string(id);
+    }
+    SimOutput(primary_message, 1);
+
+    string fallback_message = "Fallback candidates:";
+    for (MachineId_t id : *fallback_candidates) {
+        fallback_message += " " + to_string(id);
+    }
+    SimOutput(fallback_message, 1);
+
+    MachineId_t selected_machine = FindFeasibleMachine(task_id);
+    if (selected_machine == Machine_GetTotal()) {
+        SimOutput("No feasible machine found", 1);
+    } else {
+        SimOutput("Selected machine: " + to_string(selected_machine), 1);
+        VMId_t selected_vm = FindFeasibleVM(selected_machine, task_id);
+        if (selected_vm == vms.size()){
+            selected_vm = VM_Create(task_info.required_vm, task_info.required_cpu);
+            VM_Attach(selected_vm, selected_machine);
+            vms.push_back(selected_vm);
+            machine_to_vms[selected_machine].push_back(selected_vm);
+        }
+        VM_AddTask(selected_vm, task_id, MID_PRIORITY);
+    }
 }
 
 void Scheduler::PeriodicCheck(Time_t now) {
@@ -169,7 +265,7 @@ void MigrationDone(Time_t time, VMId_t vm_id) {
 
 void SchedulerCheck(Time_t time) {
     // This function is called periodically by the simulator, no specific event
-    SimOutput("SchedulerCheck(): SchedulerCheck() called at " + to_string(time), 3);
+    SimOutput("SchedulerCheck(): SchedulerCheck() called at " + to_string(time), 4);
     Scheduler.PeriodicCheck(time);
     // static unsigned counts = 0;
     // counts++;
