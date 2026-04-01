@@ -64,6 +64,34 @@ bool Scheduler::CanHostTask(MachineId_t machine_id, TaskId_t task_id) const {
     return free_memory >= required_memory;
 }
 
+MachineId_t Scheduler::FindWakeableMachine(TaskId_t task_id) const {
+    auto candidate_buckets = GetCandidateBuckets(task_id);
+    const vector<MachineId_t>* primary_candidates = candidate_buckets.first;
+    const vector<MachineId_t>* fallback_candidates = candidate_buckets.second;
+    TaskInfo_t task_info = GetTaskInfo(task_id);
+    unsigned required_memory = task_info.required_memory + VM_MEMORY_OVERHEAD;
+
+    for (MachineId_t machine_id : *primary_candidates) {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+        unsigned free_memory = machine_info.memory_size - machine_info.memory_used;
+        if (machine_info.s_state != S0 && free_memory >= required_memory) {
+            return machine_id;
+        }
+    }
+
+    for (MachineId_t machine_id : *fallback_candidates) {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+        unsigned free_memory = machine_info.memory_size - machine_info.memory_used;
+        if (machine_info.s_state != S0 && free_memory >= required_memory) {
+            return machine_id;
+        }
+    }
+
+    SimOutput("No wakeable machine found for task " + to_string(task_id)
+              + " required_mem=" + to_string(required_memory), 1);
+    return Machine_GetTotal();
+}
+
 MachineId_t Scheduler::FindFeasibleMachine(TaskId_t task_id) const {
     auto candidate_buckets = GetCandidateBuckets(task_id);
     const vector<MachineId_t>* primary_candidates = candidate_buckets.first;
@@ -102,6 +130,22 @@ VMId_t Scheduler::FindFeasibleVM(MachineId_t machine_id, TaskId_t task_id) const
     return vms.size();
 }
 
+void Scheduler::RetryWaitingTasks(Time_t now) {
+    vector<TaskId_t> pending = waiting_tasks;
+    waiting_tasks.clear();
+
+    for (TaskId_t task_id : pending) {
+        if (IsTaskCompleted(task_id)) {
+            continue;
+        }
+        if (task_to_vm[task_id] != static_cast<VMId_t>(-1)) {
+            // task is assigned to a VM
+            continue;
+        }
+        NewTask(now, task_id);
+    }
+}
+
 
 
 void Scheduler::Init() {
@@ -118,6 +162,8 @@ void Scheduler::Init() {
     SimOutput("Scheduler::Init(): Initializing scheduler", 1);
 
     machine_to_vms.resize(active_machines);
+    task_to_vm.resize(GetNumTasks(), static_cast<VMId_t>(-1));
+    machine_waking.resize(active_machines, false);
 
 
     for(unsigned i = 0; i < active_machines; i++) {
@@ -145,6 +191,17 @@ void Scheduler::Init() {
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
     // Update your data structure. The VM now can receive new tasks
+}
+
+void Scheduler::HandleMachineWake(Time_t time, MachineId_t machine_id) {
+    machine_waking[machine_id] = false;
+
+    MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+    if (machine_info.s_state != S0) {
+        return;
+    }
+
+    RetryWaitingTasks(time);
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
@@ -182,19 +239,35 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     for (MachineId_t id : *primary_candidates) {
         primary_message += " " + to_string(id);
     }
-    SimOutput(primary_message, 1);
+    SimOutput(primary_message, 3);
 
     string fallback_message = "Fallback candidates:";
     for (MachineId_t id : *fallback_candidates) {
         fallback_message += " " + to_string(id);
     }
-    SimOutput(fallback_message, 1);
+    SimOutput(fallback_message, 3);
 
     MachineId_t selected_machine = FindFeasibleMachine(task_id);
     if (selected_machine == Machine_GetTotal()) {
-        SimOutput("No feasible machine found", 1);
+        MachineId_t sleeping_machine = FindWakeableMachine(task_id);
+        if (sleeping_machine == Machine_GetTotal()) {
+            if (find(waiting_tasks.begin(), waiting_tasks.end(), task_id) == waiting_tasks.end()) {
+                waiting_tasks.push_back(task_id);
+            }
+            SimOutput("No wakeable machine found", 1);
+        } else {
+            SimOutput("No feasible machine found, waking machine " + to_string(sleeping_machine), 1);
+            if (find(waiting_tasks.begin(), waiting_tasks.end(), task_id) == waiting_tasks.end()) {
+                waiting_tasks.push_back(task_id);
+            }
+            if (!machine_waking[sleeping_machine]) {
+                machine_waking[sleeping_machine] = true;
+                Machine_SetState(sleeping_machine, S0);
+            }
+            SimOutput("Waking machine: " + to_string(sleeping_machine), 1);
+        }
     } else {
-        SimOutput("Selected machine: " + to_string(selected_machine), 1);
+        SimOutput("Selected machine: " + to_string(selected_machine), 3);
         VMId_t selected_vm = FindFeasibleVM(selected_machine, task_id);
         if (selected_vm == vms.size()){
             selected_vm = VM_Create(task_info.required_vm, task_info.required_cpu);
@@ -203,6 +276,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
             machine_to_vms[selected_machine].push_back(selected_vm);
         }
         VM_AddTask(selected_vm, task_id, MID_PRIORITY);
+        task_to_vm[task_id] = selected_vm;
     }
 }
 
@@ -218,8 +292,10 @@ void Scheduler::Shutdown(Time_t time) {
     // Report about the total energy consumed
     // Report about the SLA compliance
     // Shutdown everything to be tidy :-)
-    for(auto & vm: vms) {
-        VM_Shutdown(vm);
+    for (MachineId_t machine_id = 0; machine_id < machine_to_vms.size(); machine_id++) {
+        for (VMId_t vm_id : machine_to_vms[machine_id]) {
+            VM_Shutdown(vm_id);
+        }
     }
     SimOutput("SimulationComplete(): Finished!", 3);
     SimOutput("SimulationComplete(): Time is " + to_string(time), 3);
@@ -230,6 +306,24 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     // Decide if a machine is to be turned off, slowed down, or VMs to be migrated according to your policy
     // This is an opportunity to make any adjustments to optimize performance/energy
     SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " is complete at " + to_string(now), 3);
+
+    VMId_t vm = task_to_vm[task_id];
+    VMInfo_t vm_info = VM_GetInfo(vm);
+    MachineId_t machine_id = vm_info.machine_id;
+    task_to_vm[task_id] = static_cast<VMId_t>(-1);
+
+    if (vm_info.active_tasks.size() == 0){
+        VM_Shutdown(vm);
+        auto& vm_list = machine_to_vms[machine_id];
+        vm_list.erase(remove(vm_list.begin(), vm_list.end(), vm), vm_list.end());
+    }
+
+    if (machine_to_vms[machine_id].empty()){
+        Machine_SetState(machine_id, S5);
+        SimOutput("Sleeping machine " + to_string(machine_id), 1);
+    }
+
+    RetryWaitingTasks(now);
 }
 
 // Public interface below
@@ -294,4 +388,5 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
     // Called in response to an earlier request to change the state of a machine
+    Scheduler.HandleMachineWake(time, machine_id);
 }
