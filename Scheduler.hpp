@@ -35,6 +35,7 @@ private:
     bool VM_IsFeasible(VMId_t vm_id, TaskId_t task_id) const;
     VMId_t FindFeasibleVM(MachineId_t machine_id, TaskId_t task_id) const;
     void RetryWaitingTasks(Time_t now);
+    void DumpStalledTasks(Time_t now) const;
 
     vector<VMId_t> vms;
     vector<MachineId_t> machines;
@@ -43,8 +44,10 @@ private:
     vector<vector<VMId_t>> machine_to_vms;
     vector<bool> vm_is_migrating;
     vector<VMId_t> task_to_vm;
+    vector<bool> machine_transitioning;
     vector<bool> machine_waking;
     vector<TaskId_t> waiting_tasks;
+    unsigned completed_tasks = 0;
 };
 
 
