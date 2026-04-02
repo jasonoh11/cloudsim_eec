@@ -14,7 +14,13 @@ OBJ = $(SRC:.cpp=.o)
 # Executable
 TARGET = simulator
 
-run-v:
+run-0:
+	./simulator -v 0 ./tmp/tall_short
+
+run-1:
+	./simulator -v 1 ./tmp/canvas
+
+run-3:
 	./simulator -v 3 ./tmp/submitted_input
 
 # Default target

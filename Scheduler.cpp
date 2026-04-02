@@ -400,6 +400,13 @@ void Scheduler::PeriodicCheck(Time_t now) {
     static unsigned stagnant_heartbeats = 0;
     static unsigned last_completed_tasks = 0;
     const Time_t heartbeat_interval = 50000000;
+
+    if (retry_waiting_tasks_pending && !waiting_tasks.empty()) {
+        SimOutput("PeriodicCheck(): retrying waiting tasks outside TaskComplete callback", 1);
+        retry_waiting_tasks_pending = false;
+        RetryWaitingTasks(now);
+    }
+
     if (now - last_heartbeat >= heartbeat_interval) {
         double completion_pct = 0.0;
         if (GetNumTasks() > 0) {
@@ -502,10 +509,12 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " is complete at " + to_string(now), 3);
     completed_tasks++;
 
-    VMId_t vm = task_to_vm[task_id];
     task_to_vm[task_id] = static_cast<VMId_t>(-1);
 
-    RetryWaitingTasks(now);
+    if (!waiting_tasks.empty()) {
+        SimOutput("TaskComplete(): deferring retry of waiting tasks until SchedulerCheck()", 1);
+        retry_waiting_tasks_pending = true;
+    }
 }
 
 // Public interface below

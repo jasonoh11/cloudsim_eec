@@ -47,6 +47,7 @@ private:
     vector<bool> machine_transitioning;
     vector<bool> machine_waking;
     vector<TaskId_t> waiting_tasks;
+    bool retry_waiting_tasks_pending = false;
     unsigned completed_tasks = 0;
 };
 
