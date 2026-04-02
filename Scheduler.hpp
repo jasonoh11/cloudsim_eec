@@ -69,6 +69,7 @@ private:
 
     void InitializeMachineViews();
     void RefreshMachineStatesFromSimulator();
+    Priority_t PriorityFromSLA(SLAType_t sla) const;
 
     vector<MachineId_t> machines;
 

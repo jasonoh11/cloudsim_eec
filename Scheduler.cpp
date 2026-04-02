@@ -41,6 +41,22 @@ void Scheduler::RefreshMachineStatesFromSimulator() {
     }
 }
 
+/*
+* Helper method to convert from SLA type to a priority level. 
+*/
+Priority_t Scheduler::PriorityFromSLA(SLAType_t sla) const {
+    switch(sla) {
+        case SLA0:
+        case SLA1:
+            return HIGH_PRIORITY;
+        case SLA2:
+            return MID_PRIORITY;
+        case SLA3:
+        default:
+            return LOW_PRIORITY;
+    }
+}
+
 void Scheduler::Init() {
     // Find the parameters of the clusters
     // Get the total number of machines
@@ -110,7 +126,25 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // lazily create a compatible VM on the first S0 machine with matching CPU.
     const CPUType_t required_cpu = RequiredCPUType(task_id);
     const VMType_t required_vm = RequiredVMType(task_id);
-    const Priority_t priority = MID_PRIORITY;
+    const SLAType_t required_sla = RequiredSLA(task_id);
+    const Priority_t priority = PriorityFromSLA(required_sla);
+
+    // Keep simulator task metadata aligned with scheduler-assigned priority.
+    SetTaskPriority(task_id, priority);
+
+    task_states[task_id] = TaskState{
+        task_id,
+        required_cpu,
+        required_vm,
+        required_sla,
+        GetTaskMemory(task_id),
+        IsTaskGPUCapable(task_id),
+        priority,
+        false,
+        VMId_t(-1),
+        0,
+        false
+    };
 
     for(const auto machine_id : machines) {
         const MachineInfo_t info = Machine_GetInfo(machine_id);
@@ -137,6 +171,8 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         VM_AddTask(vm_id, task_id, priority);
         task_to_vm[task_id] = vm_id;
         vm_states[vm_id].active_tasks.insert(task_id);
+        task_states[task_id].assigned = true;
+        task_states[task_id].assigned_vm = vm_id;
         tasks_seen++;
         successful_placements++;
         return;
