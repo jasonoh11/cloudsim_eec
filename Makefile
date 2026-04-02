@@ -14,9 +14,14 @@ OBJ = $(SRC:.cpp=.o)
 # Executable
 TARGET = simulator
 
-# Run with verbose flag set to 3
-run-v:
-	./simulator -v 3 ./tmp/Input
+run-0:
+	./simulator -v 0 ./tmp/tall_short
+
+run-1:
+	./simulator -v 1 ./tmp/canvas
+
+run-3:
+	./simulator -v 3 ./tmp/submitted_input
 
 # Default target
 all: $(TARGET)
