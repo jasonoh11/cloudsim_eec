@@ -7,8 +7,39 @@
 
 #include "Scheduler.hpp"
 
-static bool migrating = false;
-static unsigned active_machines = 16;
+void Scheduler::InitializeMachineViews() {
+    machines.clear();
+    machine_views.clear();
+
+    const unsigned total_machines = Machine_GetTotal();
+    for(unsigned i = 0; i < total_machines; i++) {
+        const MachineId_t machine_id = MachineId_t(i);
+        const MachineInfo_t info = Machine_GetInfo(machine_id);
+
+        machines.push_back(machine_id);
+        machine_views[machine_id] = MachineStateView{
+            machine_id,
+            info.cpu,
+            info.memory_size,
+            info.memory_used,
+            info.gpus,
+            info.s_state,
+            {},
+            info.active_tasks,
+            false
+        };
+    }
+}
+
+void Scheduler::RefreshMachineStatesFromSimulator() {
+    for(auto machine_id : machines) {
+        const MachineInfo_t info = Machine_GetInfo(machine_id);
+        auto &view = machine_views[machine_id];
+        view.s_state = info.s_state;
+        view.tracked_memory_used = info.memory_used;
+        view.active_task_count = info.active_tasks;
+    }
+}
 
 void Scheduler::Init() {
     // Find the parameters of the clusters
@@ -19,31 +50,40 @@ void Scheduler::Init() {
     //      Get the number of CPUs
     //      Get if there is a GPU or not
     // 
-    SimOutput("Scheduler::Init(): Total number of machines is " + to_string(Machine_GetTotal()), 3);
+    const unsigned total_machines = Machine_GetTotal();
+    SimOutput("Scheduler::Init(): Total number of machines is " + to_string(total_machines), 3);
     SimOutput("Scheduler::Init(): Initializing scheduler", 1);
-    for(unsigned i = 0; i < active_machines; i++)
-        vms.push_back(VM_Create(LINUX, X86));
-    for(unsigned i = 0; i < active_machines; i++) {
-        machines.push_back(MachineId_t(i));
-    }    
-    for(unsigned i = 0; i < active_machines; i++) {
-        VM_Attach(vms[i], machines[i]);
-    }
 
-    bool dynamic = false;
-    if(dynamic)
-        for(unsigned i = 0; i<4 ; i++)
-            for(unsigned j = 0; j < 8; j++)
-                Machine_SetCorePerformance(MachineId_t(0), j, P3);
-    // Turn off the ARM machines
-    for(unsigned i = 24; i < Machine_GetTotal(); i++)
-        Machine_SetState(MachineId_t(i), S5);
+    //RESET SCHEDULER STATES
+    task_states.clear();
+    vm_states.clear();
+    task_to_vm.clear();
+    retry_queue.clear();
+    failed_task_ids.clear();
 
-    SimOutput("Scheduler::Init(): VM ids are " + to_string(vms[0]) + " ahd " + to_string(vms[1]), 3);
+    //RESET SCHEDULER REPORTING COUNTERS
+    tasks_seen = 0;
+    successful_placements = 0;
+    retry_enqueues = 0;
+    retry_attempts = 0;
+    placement_failures = 0;
+    vms_created = 0;
+    migrations = 0;
+    wakeups = 0;
+
+    InitializeMachineViews();
+    RefreshMachineStatesFromSimulator();
+
+    SimOutput("Scheduler::Init(): machine state scaffolding initialized", 2);
 }
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
     // Update your data structure. The VM now can receive new tasks
+    (void)time;
+    auto vm_it = vm_states.find(vm_id);
+    if(vm_it != vm_states.end()) {
+        vm_it->second.migrating = false;
+    }
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
@@ -64,13 +104,47 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     // Turn on a machine, migrate an existing VM from a loaded machine....
     //
     // Other possibilities as desired
-    Priority_t priority = (task_id == 0 || task_id == 64)? HIGH_PRIORITY : MID_PRIORITY;
-    if(migrating) {
-        VM_AddTask(vms[0], task_id, priority);
+    (void)now;
+
+    // Temporary safe behavior before phase-3+ policy logic:
+    // lazily create a compatible VM on the first S0 machine with matching CPU.
+    const CPUType_t required_cpu = RequiredCPUType(task_id);
+    const VMType_t required_vm = RequiredVMType(task_id);
+    const Priority_t priority = MID_PRIORITY;
+
+    for(const auto machine_id : machines) {
+        const MachineInfo_t info = Machine_GetInfo(machine_id);
+        if(info.s_state != S0 || info.cpu != required_cpu) {
+            continue;
+        }
+
+        VMId_t vm_id = VMId_t(-1);
+        for(const auto &kv : vm_states) {
+            if(kv.second.machine_id == machine_id && kv.second.cpu == required_cpu && kv.second.vm_type == required_vm && !kv.second.migrating) {
+                vm_id = kv.first;
+                break;
+            }
+        }
+
+        if(vm_id == VMId_t(-1)) {
+            vm_id = VM_Create(required_vm, required_cpu);
+            VM_Attach(vm_id, machine_id);
+            vm_states[vm_id] = VMState{vm_id, machine_id, required_vm, required_cpu, false, {}, VM_MEMORY_OVERHEAD};
+            machine_views[machine_id].active_vms.insert(vm_id);
+            vms_created++;
+        }
+
+        VM_AddTask(vm_id, task_id, priority);
+        task_to_vm[task_id] = vm_id;
+        vm_states[vm_id].active_tasks.insert(task_id);
+        tasks_seen++;
+        successful_placements++;
+        return;
     }
-    else {
-        VM_AddTask(vms[task_id % active_machines], task_id, priority);
-    }// Skeleton code, you need to change it according to your algorithm
+
+    retry_queue.push_back({task_id});
+    retry_enqueues++;
+    tasks_seen++;
 }
 
 void Scheduler::PeriodicCheck(Time_t now) {
@@ -78,6 +152,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
     // SchedulerCheck is called periodically by the simulator to allow you to monitor, make decisions, adjustments, etc.
     // Unlike the other invocations of the scheduler, this one doesn't report any specific event
     // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
+    (void)now;
 }
 
 void Scheduler::Shutdown(Time_t time) {
@@ -85,8 +160,8 @@ void Scheduler::Shutdown(Time_t time) {
     // Report about the total energy consumed
     // Report about the SLA compliance
     // Shutdown everything to be tidy :-)
-    for(auto & vm: vms) {
-        VM_Shutdown(vm);
+    for(auto & vm_entry: vm_states) {
+        VM_Shutdown(vm_entry.first);
     }
     SimOutput("SimulationComplete(): Finished!", 4);
     SimOutput("SimulationComplete(): Time is " + to_string(time), 4);
@@ -127,19 +202,12 @@ void MigrationDone(Time_t time, VMId_t vm_id) {
     // The function is called on to alert you that migration is complete
     SimOutput("MigrationDone(): Migration of VM " + to_string(vm_id) + " was completed at time " + to_string(time), 4);
     Scheduler.MigrationComplete(time, vm_id);
-    migrating = false;
 }
 
 void SchedulerCheck(Time_t time) {
     // This function is called periodically by the simulator, no specific event
     SimOutput("SchedulerCheck(): SchedulerCheck() called at " + to_string(time), 4);
     Scheduler.PeriodicCheck(time);
-    static unsigned counts = 0;
-    counts++;
-    if(counts == 10) {
-        migrating = true;
-        VM_Migrate(1, 9);
-    }
 }
 
 void SimulationComplete(Time_t time) {
@@ -156,7 +224,8 @@ void SimulationComplete(Time_t time) {
 }
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
-    
+    (void)time;
+    (void)task_id;
 }
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
