@@ -13,15 +13,23 @@ OBJ = $(SRC:.cpp=.o)
 
 # Executable
 TARGET = simulator
+VERBOSE ?= 0
+INPUT ?= ./tmp/canvas
 
-run-0:
-	./simulator -v 0 ./tmp/tall_short
+run: $(TARGET)
+	./$(TARGET) -v $(VERBOSE) $(INPUT)
 
-run-1:
-	./simulator -v 1 ./tmp/canvas
+run-0: VERBOSE=0
+run-0: INPUT=./tmp/tall_short
+run-0: run
 
-run-3:
-	./simulator -v 3 ./tmp/submitted_input
+run-1: VERBOSE=1
+run-1: INPUT=./tmp/canvas
+run-1: run
+
+run-3: VERBOSE=3
+run-3: INPUT=./tmp/submitted_input
+run-3: run
 
 # Default target
 all: $(TARGET)
