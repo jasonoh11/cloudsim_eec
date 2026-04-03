@@ -27,7 +27,6 @@ private:
     static const unsigned CPU_TYPE_COUNT = 4;
     float GetEfficiencyScore(MachineId_t) const;
     void SortByEfficiency(vector<MachineId_t>&);
-    void PrintMachineBuckets() const;
     const vector<MachineId_t>& GetMachineBucket(MachineId_t machine_id) const;
     unsigned CountAwakeMachines(const vector<MachineId_t>& bucket) const;
     bool ShouldSleepMachine(MachineId_t machine_id, Time_t now) const;
@@ -38,21 +37,17 @@ private:
     bool VM_IsFeasible(VMId_t vm_id, TaskId_t task_id) const;
     VMId_t FindFeasibleVM(MachineId_t machine_id, TaskId_t task_id) const;
     void RetryWaitingTasks(Time_t now);
-    void DumpStalledTasks(Time_t now) const;
 
     vector<VMId_t> vms;
-    vector<MachineId_t> machines;
     vector<MachineId_t> gpu_machines_by_cpu[CPU_TYPE_COUNT];
     vector<MachineId_t> non_gpu_machines_by_cpu[CPU_TYPE_COUNT];
     vector<vector<VMId_t>> machine_to_vms;
-    vector<bool> vm_is_migrating;
     vector<VMId_t> task_to_vm;
     vector<bool> machine_transitioning;
     vector<bool> machine_waking;
     vector<Time_t> machine_last_busy_time;
     vector<TaskId_t> waiting_tasks;
     bool retry_waiting_tasks_pending = false;
-    unsigned completed_tasks = 0;
 };
 
 
