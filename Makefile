@@ -15,12 +15,17 @@ OBJ = $(SRC:.cpp=.o)
 TARGET = simulator
 LOG_DIR = tmp/run_logs
 LABEL ?= run
+INPUT ?= ./tmp/Input
 TIMESTAMP = $(shell date +%Y%m%d_%H%M%S)
 LOG_FILE = $(LOG_DIR)/$(LABEL)_$(TIMESTAMP).log
 
 # Run with verbose flag set to 3
 run-v:
-	./simulator -v 3 ./tmp/Input
+	./simulator -v 3 $(INPUT)
+
+# Run with verbose flag set to 4 so scheduler-level messages are visible.
+run-v4:
+	./simulator -v 4 $(INPUT)
 
 # Run and capture all console output to a labeled, timestamped log file.
 # Usage examples:
@@ -30,13 +35,23 @@ run-v:
 run-log: $(TARGET)
 	@mkdir -p $(LOG_DIR)
 	@echo "Writing log to $(LOG_FILE)"
-	@./$(TARGET) ./tmp/Input > $(LOG_FILE) 2>&1
+	@./$(TARGET) $(INPUT) > $(LOG_FILE) 2>&1
 	@echo "Completed. Log: $(LOG_FILE)"
 
 run-v-log: $(TARGET)
 	@mkdir -p $(LOG_DIR)
 	@echo "Writing log to $(LOG_FILE)"
-	@./$(TARGET) -v 3 ./tmp/Input > $(LOG_FILE) 2>&1
+	@./$(TARGET) -v 3 $(INPUT) > $(LOG_FILE) 2>&1
+	@echo "Completed. Log: $(LOG_FILE)"
+
+# Higher-verbosity log target for easier hang-vs-running diagnosis.
+# Usage examples:
+#   make run-v4-log
+#   make run-v4-log LABEL=debug
+run-v4-log: $(TARGET)
+	@mkdir -p $(LOG_DIR)
+	@echo "Writing log to $(LOG_FILE)"
+	@./$(TARGET) -v 4 $(INPUT) > $(LOG_FILE) 2>&1
 	@echo "Completed. Log: $(LOG_FILE)"
 
 # Default target
@@ -54,4 +69,4 @@ $(TARGET): $(OBJ)
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
 
-.PHONY: all scheduler run-v run-log run-v-log
+.PHONY: all scheduler run-v run-v4 run-log run-v-log run-v4-log

@@ -1,0 +1,74 @@
+# Fast debug input for placement-path testing
+# Small machine set, early task arrivals, and multiple CPU families.
+
+machine class:
+{
+ Number of machines: 1
+ CPU type: X86
+ Number of cores: 2
+ Memory: 2048
+ S-States: [100, 80, 60, 40, 20, 5, 0]
+ P-States: [10, 7, 5, 3]
+ C-States: [10, 3, 1, 0]
+ MIPS: [1000, 750, 500, 250]
+ GPUs: no
+}
+
+machine class:
+{
+ Number of machines: 1
+ CPU type: ARM
+ Number of cores: 2
+ Memory: 2048
+ S-States: [90, 70, 50, 35, 18, 5, 0]
+ P-States: [9, 7, 5, 3]
+ C-States: [9, 3, 1, 0]
+ MIPS: [850, 650, 500, 300]
+ GPUs: no
+}
+
+
+task class:
+{
+ Start time: 0
+ End time: 200000
+ Inter arrival: 10000
+ Expected runtime: 20000
+ Memory: 64
+ VM type: LINUX
+ GPU enabled: no
+ SLA type: SLA3
+ CPU type: X86
+ Task type: WEB
+ Seed: 11
+}
+
+task class:
+{
+ Start time: 0
+ End time: 200000
+ Inter arrival: 10000
+ Expected runtime: 20000
+ Memory: 64
+ VM type: LINUX
+ GPU enabled: no
+ SLA type: SLA3
+ CPU type: ARM
+ Task type: WEB
+ Seed: 12
+}
+
+task class:
+{
+ Start time: 0
+ End time: 200000
+ Inter arrival: 10000
+ Expected runtime: 20000
+ Memory: 64
+ VM type: LINUX
+ GPU enabled: no
+ SLA type: SLA3
+ CPU type: X86
+ Task type: WEB
+ Seed: 13
+}

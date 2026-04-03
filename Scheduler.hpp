@@ -67,9 +67,14 @@ private:
         TaskId_t task_id;
     };
 
+    static constexpr double kCapacityCap = 0.80;
+
     void InitializeMachineViews();
     void RefreshMachineStatesFromSimulator();
     Priority_t PriorityFromSLA(SLAType_t sla) const;
+    unsigned AdditionalPlacementMemory(TaskId_t task_id, bool creating_vm) const;
+    bool IsMachineFeasible(TaskId_t task_id, MachineId_t machine_id, bool creating_vm) const;
+    bool HasReusableVM(MachineId_t machine_id, VMType_t required_vm, CPUType_t required_cpu, VMId_t &vm_id) const;
 
     vector<MachineId_t> machines;
 

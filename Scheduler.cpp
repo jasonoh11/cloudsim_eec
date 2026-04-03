@@ -57,6 +57,62 @@ Priority_t Scheduler::PriorityFromSLA(SLAType_t sla) const {
     }
 }
 
+
+/*
+* Helper method to calculate additional memory needed for task placement if new VM.
+*/
+unsigned Scheduler::AdditionalPlacementMemory(TaskId_t task_id, bool creating_vm) const {
+    unsigned extra = GetTaskMemory(task_id);
+    if(creating_vm) {
+        extra += VM_MEMORY_OVERHEAD;
+    }
+    return extra;
+}
+
+/* Logic for if a machine can accommodate a task */
+bool Scheduler::IsMachineFeasible(TaskId_t task_id, MachineId_t machine_id, bool creating_vm) const {
+    const auto machine_it = machine_views.find(machine_id);
+    if(machine_it == machine_views.end()) {
+        return false;
+    }
+
+    const auto task_it = task_states.find(task_id);
+    if(task_it == task_states.end()) {
+        return false;
+    }
+
+    const MachineStateView &machine = machine_it->second;
+    const TaskState &task = task_it->second;
+
+    if(machine.s_state != S0) {
+        return false;
+    }
+
+    if(machine.cpu != task.required_cpu) {
+        return false;
+    }
+
+    if(machine.memory_capacity == 0) {
+        return false;
+    }
+
+    const unsigned projected_used = machine.tracked_memory_used + AdditionalPlacementMemory(task_id, creating_vm);
+    const double projected_utilization = static_cast<double>(projected_used) / static_cast<double>(machine.memory_capacity);
+    return projected_utilization < kCapacityCap;
+}
+
+bool Scheduler::HasReusableVM(MachineId_t machine_id, VMType_t required_vm, CPUType_t required_cpu, VMId_t &vm_id) const {
+    vm_id = VMId_t(-1);
+    for(const auto &kv : vm_states) {
+        const VMState &vm_state = kv.second;
+        if(vm_state.machine_id == machine_id && vm_state.cpu == required_cpu && vm_state.vm_type == required_vm && !vm_state.migrating) {
+            vm_id = kv.first;
+            return true;
+        }
+    }
+    return false;
+}
+
 void Scheduler::Init() {
     // Find the parameters of the clusters
     // Get the total number of machines
@@ -147,30 +203,29 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
     };
 
     for(const auto machine_id : machines) {
-        const MachineInfo_t info = Machine_GetInfo(machine_id);
-        if(info.s_state != S0 || info.cpu != required_cpu) {
+        VMId_t vm_id = VMId_t(-1);
+        const bool has_reusable_vm = HasReusableVM(machine_id, required_vm, required_cpu, vm_id);
+        const bool creating_vm = !has_reusable_vm;
+
+        if(!IsMachineFeasible(task_id, machine_id, creating_vm)) {
             continue;
         }
 
-        VMId_t vm_id = VMId_t(-1);
-        for(const auto &kv : vm_states) {
-            if(kv.second.machine_id == machine_id && kv.second.cpu == required_cpu && kv.second.vm_type == required_vm && !kv.second.migrating) {
-                vm_id = kv.first;
-                break;
-            }
-        }
-
-        if(vm_id == VMId_t(-1)) {
+        if(!has_reusable_vm) {
             vm_id = VM_Create(required_vm, required_cpu);
             VM_Attach(vm_id, machine_id);
             vm_states[vm_id] = VMState{vm_id, machine_id, required_vm, required_cpu, false, {}, VM_MEMORY_OVERHEAD};
             machine_views[machine_id].active_vms.insert(vm_id);
+            machine_views[machine_id].tracked_memory_used += VM_MEMORY_OVERHEAD;
             vms_created++;
         }
 
         VM_AddTask(vm_id, task_id, priority);
         task_to_vm[task_id] = vm_id;
         vm_states[vm_id].active_tasks.insert(task_id);
+        vm_states[vm_id].tracked_memory_footprint += task_states[task_id].required_memory;
+        machine_views[machine_id].tracked_memory_used += task_states[task_id].required_memory;
+        machine_views[machine_id].active_task_count++;
         task_states[task_id].assigned = true;
         task_states[task_id].assigned_vm = vm_id;
         tasks_seen++;

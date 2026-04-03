@@ -1,0 +1,31 @@
+# Minimal debug input for greedy scheduler development
+# One machine class, one task class, single task arrival.
+
+machine class:
+{
+ Number of machines: 1
+ CPU type: X86
+ Number of cores: 4
+ Memory: 4096
+ S-States: [100, 80, 60, 40, 20, 5, 0]
+ P-States: [10, 7, 5, 3]
+ C-States: [10, 3, 1, 0]
+ MIPS: [1000, 750, 500, 250]
+ GPUs: no
+}
+
+
+task class:
+{
+ Start time: 0
+ End time: 1000000
+ Inter arrival: 1000000
+ Expected runtime: 100000
+ Memory: 512
+ VM type: LINUX
+ GPU enabled: no
+ SLA type: SLA3
+ CPU type: X86
+ Task type: WEB
+ Seed: 1
+}
