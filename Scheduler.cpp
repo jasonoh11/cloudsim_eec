@@ -17,8 +17,13 @@ constexpr double kOverloadThreshold = 0.80;
 constexpr double kUnderloadThreshold = 0.25;
 constexpr double kMigrationTriggerThreshold = 1.00;
 constexpr unsigned kMinReadyMachinesPerCpu = 3;
+constexpr unsigned kMinReadyPreferredMachinesPerCpu = 8;
+constexpr unsigned kMinReadyGpuMachinesPerCpu = 4;
 constexpr Time_t kProtectionWindow = 5'000'000;
-constexpr bool kEnableIdleSleep = false;
+constexpr Time_t kIdleSleepDelay = 2'000'000;
+constexpr Time_t kPreferredIdleSleepDelay = 10'000'000;
+constexpr Time_t kEnergyDebugInterval = 5'000'000;
+constexpr bool kEnableIdleSleep = true;
 constexpr bool kEnableUnderloadEvacuation = false;
 constexpr unsigned kPreferredTierReserveDivisor = 4;
 
@@ -166,6 +171,54 @@ double ProjectedLoad(MachineId_t machine_id, TaskId_t task_id, bool creating_vm)
     return std::max(projected_tasks, memory_pressure);
 }
 
+bool IsPreferredMachineForCpu(const unordered_map<CPUType_t, uint64_t> & best_capacity_by_cpu,
+                              const MachineInfo_t & machine_info) {
+    auto best_it = best_capacity_by_cpu.find(machine_info.cpu);
+    uint64_t best_score = (best_it == best_capacity_by_cpu.end()) ? 0 : best_it->second;
+    if(best_score == 0) {
+        return true;
+    }
+    unsigned base_mips = machine_info.performance.empty() ? 0 : machine_info.performance[0];
+    uint64_t machine_score = static_cast<uint64_t>(machine_info.num_cpus) * base_mips;
+    return machine_score * 100 >= best_score * 75;
+}
+
+const char * CpuTypeName(CPUType_t cpu_type) {
+    switch(cpu_type) {
+        case X86:
+            return "X86";
+        case ARM:
+            return "ARM";
+        case POWER:
+            return "POWER";
+        case RISCV:
+            return "RISCV";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+const char * MachineStateName(MachineState_t state) {
+    switch(state) {
+        case S0:
+            return "S0";
+        case S0i1:
+            return "S0i1";
+        case S1:
+            return "S1";
+        case S2:
+            return "S2";
+        case S3:
+            return "S3";
+        case S4:
+            return "S4";
+        case S5:
+            return "S5";
+        default:
+            return "UNKNOWN";
+    }
+}
+
 }  // namespace
 
 Scheduler::HostState Scheduler::ClassifyMachine(MachineId_t machine_id) const {
@@ -275,7 +328,9 @@ bool Scheduler::TryPlaceTask(TaskId_t task_id, bool log_failure) {
         }
         MachineId_t machine_id = vm_info.machine_id;
         const MachineInfo_t & machine_info = machine_infos.at(machine_id);
-        if(machine_info.s_state != S0 || !has_machine_memory_for_task(machine_id, false)) {
+        if(pending_state_changes.count(machine_id) != 0 ||
+           machine_info.s_state != S0 ||
+           !has_machine_memory_for_task(machine_id, false)) {
             continue;
         }
         double vm_projected_load = projected_load(machine_id, false);
@@ -299,7 +354,9 @@ bool Scheduler::TryPlaceTask(TaskId_t task_id, bool log_failure) {
 
     for(MachineId_t machine_id : machines) {
         const MachineInfo_t & machine_info = machine_infos.at(machine_id);
-        if(machine_info.cpu != required_cpu || machine_info.s_state != S0) {
+        if(pending_state_changes.count(machine_id) != 0 ||
+           machine_info.cpu != required_cpu ||
+           machine_info.s_state != S0) {
             continue;
         }
         if(!has_machine_memory_for_task(machine_id, true)) {
@@ -340,6 +397,20 @@ bool Scheduler::TryPlaceTask(TaskId_t task_id, bool log_failure) {
     }
 
     if(use_existing_vm) {
+        VMInfo_t vm_info = VM_GetInfo(best_existing_vm);
+        MachineInfo_t machine_info = Machine_GetInfo(vm_info.machine_id);
+        if(pending_state_changes.count(vm_info.machine_id) != 0 ||
+           machine_info.s_state != S0) {
+            SimOutput("Scheduler::NewTask(): existing VM " + to_string(best_existing_vm) +
+                      " became unavailable before placement on machine " +
+                      to_string(vm_info.machine_id), 1);
+            use_existing_vm = false;
+        }
+    }
+
+    if(use_existing_vm) {
+        VMInfo_t vm_info = VM_GetInfo(best_existing_vm);
+        idle_since.erase(vm_info.machine_id);
         VM_AddTask(best_existing_vm, task_id, priority);
         task_to_vm[task_id] = best_existing_vm;
         SimOutput("Scheduler::NewTask(): Added task " + to_string(task_id) +
@@ -350,6 +421,15 @@ bool Scheduler::TryPlaceTask(TaskId_t task_id, bool log_failure) {
     }
 
     if(best_machine != numeric_limits<MachineId_t>::max()) {
+        MachineInfo_t latest_machine_info = Machine_GetInfo(best_machine);
+        if(pending_state_changes.count(best_machine) != 0 ||
+           latest_machine_info.s_state != S0) {
+            SimOutput("Scheduler::NewTask(): machine " + to_string(best_machine) +
+                      " became unavailable before VM attach for task " +
+                      to_string(task_id), 1);
+            return false;
+        }
+        idle_since.erase(best_machine);
         VMId_t vm_id = VM_Create(RequiredVMType(task_id), RequiredCPUType(task_id));
         VM_Attach(vm_id, best_machine);
         vms.push_back(vm_id);
@@ -428,6 +508,7 @@ bool Scheduler::TryWakeMachineForTask(TaskId_t task_id) {
         return false;
     }
 
+    idle_since.erase(best_machine);
     pending_state_changes.insert(best_machine);
     Machine_SetState(best_machine, S0);
     SimOutput("Scheduler::TryWakeMachineForTask(): waking machine " +
@@ -453,28 +534,100 @@ unsigned Scheduler::CountReadyMachines(CPUType_t cpu_type, MachineId_t exclude_m
     return ready_count;
 }
 
+unsigned Scheduler::CountReadyPreferredMachines(CPUType_t cpu_type, MachineId_t exclude_machine) const {
+    unsigned ready_count = 0;
+    for(MachineId_t candidate : machines) {
+        if(candidate == exclude_machine) {
+            continue;
+        }
+        if(pending_state_changes.count(candidate) != 0) {
+            continue;
+        }
+
+        MachineInfo_t machine_info = Machine_GetInfo(candidate);
+        if(machine_info.cpu == cpu_type &&
+           machine_info.s_state == S0 &&
+           IsPreferredMachineForCpu(best_capacity_by_cpu, machine_info)) {
+            ready_count++;
+        }
+    }
+    return ready_count;
+}
+
+unsigned Scheduler::CountReadyGpuMachines(CPUType_t cpu_type, MachineId_t exclude_machine) const {
+    unsigned ready_count = 0;
+    for(MachineId_t candidate : machines) {
+        if(candidate == exclude_machine) {
+            continue;
+        }
+        if(pending_state_changes.count(candidate) != 0) {
+            continue;
+        }
+
+        MachineInfo_t machine_info = Machine_GetInfo(candidate);
+        if(machine_info.cpu == cpu_type &&
+           machine_info.s_state == S0 &&
+           machine_info.gpus) {
+            ready_count++;
+        }
+    }
+    return ready_count;
+}
+
 void Scheduler::MaybeSleepMachine(MachineId_t machine_id, Time_t now) {
     if(!kEnableIdleSleep) {
         return;
     }
     if(!waiting_tasks.empty()) {
+        idle_since.erase(machine_id);
         return;
     }
     if(pending_state_changes.count(machine_id) != 0) {
+        idle_since.erase(machine_id);
         return;
     }
     if(IsMachineProtected(machine_id, now)) {
+        idle_since.erase(machine_id);
         return;
+    }
+    for(const auto & destination_entry : migration_destinations) {
+        if(destination_entry.second == machine_id) {
+            idle_since.erase(machine_id);
+            return;
+        }
     }
 
     MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+    bool is_preferred = IsPreferredMachineForCpu(best_capacity_by_cpu, machine_info);
     if(machine_info.s_state != S0 || machine_info.active_tasks != 0 || machine_info.active_vms != 0) {
-        return;
-    }
-    if(CountReadyMachines(machine_info.cpu, machine_id) < (kMinReadyMachinesPerCpu - 1)) {
+        idle_since.erase(machine_id);
         return;
     }
 
+    if(machine_info.gpus &&
+       CountReadyGpuMachines(machine_info.cpu, machine_id) < kMinReadyGpuMachinesPerCpu) {
+        return;
+    }
+
+    if(is_preferred) {
+        if(CountReadyPreferredMachines(machine_info.cpu, machine_id) < kMinReadyPreferredMachinesPerCpu) {
+            return;
+        }
+    } else if(CountReadyMachines(machine_info.cpu, machine_id) < kMinReadyMachinesPerCpu) {
+        return;
+    }
+
+    auto idle_it = idle_since.find(machine_id);
+    if(idle_it == idle_since.end()) {
+        idle_since[machine_id] = now;
+        return;
+    }
+    Time_t idle_delay = is_preferred ? kPreferredIdleSleepDelay : kIdleSleepDelay;
+    if(now - idle_it->second < idle_delay) {
+        return;
+    }
+
+    idle_since.erase(machine_id);
     pending_state_changes.insert(machine_id);
     Machine_SetState(machine_id, S0i1);
     SimOutput("Scheduler::MaybeSleepMachine(): moving idle machine " +
@@ -839,9 +992,16 @@ void Scheduler::Init() {
     total_tasks = GetNumTasks();
     completed_tasks = 0;
     next_progress_percent = 10;
+    max_target_completion = 0;
+    next_time_progress_percent = 10;
+    next_energy_debug_time = kEnergyDebugInterval;
     SimOutput("Scheduler::Init(): Total number of machines is " + to_string(total_machines), 3);
     SimOutput("Scheduler::Init(): Total number of tasks is " + to_string(total_tasks), 2);
     SimOutput("Scheduler::Init(): Initializing scheduler", 1);
+    for(unsigned i = 0; i < total_tasks; i++) {
+        TaskInfo_t task_info = GetTaskInfo(TaskId_t(i));
+        max_target_completion = max(max_target_completion, task_info.target_completion);
+    }
     for(unsigned i = 0; i < total_machines; i++) {
         machines.push_back(MachineId_t(i));
         MachineInfo_t info = Machine_GetInfo(MachineId_t(i));
@@ -872,6 +1032,7 @@ void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
             machine_sla_vm_counts[source_it->second][vm_sla]--;
         }
         machine_sla_vm_counts[destination_it->second][vm_sla]++;
+        idle_since.erase(destination_it->second);
     }
 
     migrating_vms.erase(vm_id);
@@ -939,6 +1100,17 @@ void Scheduler::PeriodicCheck(Time_t now) {
         MaybeSleepMachine(machine_id, now);
     }
     RetryWaitingTasks(now);
+    if(max_target_completion > 0) {
+        unsigned time_progress_percent = static_cast<unsigned>((now * 100) / max_target_completion);
+        while(next_time_progress_percent <= 100 &&
+              time_progress_percent >= next_time_progress_percent) {
+            SimOutput("Scheduler::TimeProgress(): " + to_string(next_time_progress_percent) +
+                      "% of simulated timeline (" + to_string(now) + "/" +
+                      to_string(max_target_completion) + " us)", 0);
+            next_time_progress_percent += 10;
+        }
+    }
+    MaybePrintEnergyDebugSummary(now);
 }
 
 void Scheduler::Shutdown(Time_t time) {
@@ -1023,6 +1195,107 @@ void Scheduler::StateChangeFinished(Time_t time, MachineId_t machine_id) {
     SimOutput("Scheduler::StateChangeFinished(): machine " + to_string(machine_id) +
               " completed state change at time " + to_string(time), 2);
     RetryWaitingTasks(time);
+}
+
+void Scheduler::MaybePrintEnergyDebugSummary(Time_t now) {
+    if(now < next_energy_debug_time) {
+        return;
+    }
+    next_energy_debug_time = now + kEnergyDebugInterval;
+
+    unsigned s0_count = 0;
+    unsigned s0i1_count = 0;
+    unsigned deeper_sleep_count = 0;
+    unsigned active_machine_count = 0;
+    unsigned empty_s0_preferred = 0;
+    unsigned empty_s0_nonpreferred = 0;
+    unsigned overloaded_count = 0;
+    unsigned normal_count = 0;
+    unsigned underloaded_count = 0;
+
+    struct HotMachine {
+        double load = -1.0;
+        MachineId_t machine_id = 0;
+        MachineInfo_t info{};
+    };
+    vector<HotMachine> hottest;
+
+    for(MachineId_t machine_id : machines) {
+        MachineInfo_t info = Machine_GetInfo(machine_id);
+        double load = MachineLoadScore(machine_id);
+
+        if(info.s_state == S0) {
+            s0_count++;
+        } else if(info.s_state == S0i1) {
+            s0i1_count++;
+        } else {
+            deeper_sleep_count++;
+        }
+
+        if(info.active_tasks > 0) {
+            active_machine_count++;
+        }
+
+        if(info.s_state == S0 && info.active_tasks == 0 && info.active_vms == 0) {
+            if(IsPreferredMachineForCpu(best_capacity_by_cpu, info)) {
+                empty_s0_preferred++;
+            } else {
+                empty_s0_nonpreferred++;
+            }
+        }
+
+        auto host_it = host_states.find(machine_id);
+        if(host_it != host_states.end()) {
+            switch(host_it->second) {
+                case HostState::OVERLOADED:
+                    overloaded_count++;
+                    break;
+                case HostState::NORMAL:
+                    normal_count++;
+                    break;
+                case HostState::UNDERLOADED:
+                    underloaded_count++;
+                    break;
+            }
+        }
+
+        hottest.push_back({load, machine_id, info});
+    }
+
+    sort(hottest.begin(), hottest.end(), [](const HotMachine & lhs, const HotMachine & rhs) {
+        return lhs.load > rhs.load;
+    });
+
+    SimOutput("Scheduler::EnergyDebug(): time=" + to_string(now) +
+              " energy=" + to_string(Machine_GetClusterEnergy()) +
+              " waiting=" + to_string(waiting_tasks.size()) +
+              " migrating=" + to_string(migrating_vms.size()) +
+              " pending_state_changes=" + to_string(pending_state_changes.size()) +
+              " S0=" + to_string(s0_count) +
+              " S0i1=" + to_string(s0i1_count) +
+              " deeper_sleep=" + to_string(deeper_sleep_count) +
+              " active_machines=" + to_string(active_machine_count) +
+              " overloaded=" + to_string(overloaded_count) +
+              " normal=" + to_string(normal_count) +
+              " underloaded=" + to_string(underloaded_count), 1);
+
+    SimOutput("Scheduler::EnergyDebugIdle(): empty_S0_preferred=" + to_string(empty_s0_preferred) +
+              " empty_S0_nonpreferred=" + to_string(empty_s0_nonpreferred) +
+              " idle_tracking=" + to_string(idle_since.size()), 1);
+
+    string hot_line = "Scheduler::EnergyDebugHot():";
+    unsigned hot_limit = min<unsigned>(3, hottest.size());
+    for(unsigned i = 0; i < hot_limit; i++) {
+        const HotMachine & hot = hottest[i];
+        hot_line += " m=" + to_string(hot.machine_id) +
+                    "(" + CpuTypeName(hot.info.cpu) + "," + MachineStateName(hot.info.s_state) + ")" +
+                    " load=" + to_string(hot.load) +
+                    " tasks=" + to_string(hot.info.active_tasks) +
+                    " vms=" + to_string(hot.info.active_vms) +
+                    " mem=" + to_string(hot.info.memory_used) + "/" +
+                    to_string(hot.info.memory_size);
+    }
+    SimOutput(hot_line, 1);
 }
 
 void Scheduler::HandleSLAWarning(Time_t time, TaskId_t task_id) {

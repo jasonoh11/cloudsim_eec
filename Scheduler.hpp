@@ -47,7 +47,10 @@ private:
     void MaybeRelieveOverload(Time_t now);
     void MaybeEvacuateUnderload(Time_t now);
     void RetryWaitingTasks(Time_t now);
+    void MaybePrintEnergyDebugSummary(Time_t now);
     unsigned CountReadyMachines(CPUType_t cpu_type, MachineId_t exclude_machine) const;
+    unsigned CountReadyPreferredMachines(CPUType_t cpu_type, MachineId_t exclude_machine) const;
+    unsigned CountReadyGpuMachines(CPUType_t cpu_type, MachineId_t exclude_machine) const;
 
     vector<VMId_t> vms;
     vector<MachineId_t> machines;
@@ -63,9 +66,13 @@ private:
     unordered_set<MachineId_t> pending_state_changes;
     unordered_map<MachineId_t, HostState> host_states;
     unordered_map<MachineId_t, Time_t> protected_until;
+    unordered_map<MachineId_t, Time_t> idle_since;
     unsigned total_tasks = 0;
     unsigned completed_tasks = 0;
     unsigned next_progress_percent = 10;
+    Time_t max_target_completion = 0;
+    unsigned next_time_progress_percent = 10;
+    Time_t next_energy_debug_time = 0;
 };
 
 
