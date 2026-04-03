@@ -9,14 +9,17 @@
 
 #include <algorithm>
 #include <limits>
+#include <unordered_map>
 
 namespace {
 
 constexpr double kOverloadThreshold = 0.80;
 constexpr double kUnderloadThreshold = 0.25;
+constexpr double kMigrationTriggerThreshold = 1.00;
 constexpr unsigned kMinReadyMachinesPerCpu = 3;
 constexpr Time_t kProtectionWindow = 5'000'000;
 constexpr bool kEnableIdleSleep = false;
+constexpr bool kEnableUnderloadEvacuation = false;
 constexpr unsigned kPreferredTierReserveDivisor = 4;
 
 uint64_t MachineCapacityScore(MachineId_t machine_id) {
@@ -25,91 +28,67 @@ uint64_t MachineCapacityScore(MachineId_t machine_id) {
     return static_cast<uint64_t>(machine_info.num_cpus) * base_mips;
 }
 
-bool IsPreferredPerformanceTier(const unordered_map<CPUType_t, uint64_t> & best_capacity_by_cpu,
-                               TaskId_t task_id,
-                               MachineId_t machine_id) {
-    SLAType_t sla = RequiredSLA(task_id);
-    if(sla != SLA0 && sla != SLA1) {
-        return true;
+unsigned EstimatedVmMemory(VMId_t vm_id) {
+    VMInfo_t vm_info = VM_GetInfo(vm_id);
+    unsigned total_memory = VM_MEMORY_OVERHEAD;
+    for(TaskId_t task_id : vm_info.active_tasks) {
+        total_memory += GetTaskMemory(task_id);
     }
-
-    auto best_it = best_capacity_by_cpu.find(RequiredCPUType(task_id));
-    uint64_t best_score = (best_it == best_capacity_by_cpu.end()) ? 0 : best_it->second;
-    uint64_t machine_score = MachineCapacityScore(machine_id);
-    if(best_score == 0) {
-        return true;
-    }
-
-    // Treat the top tier for a CPU family as the preferred landing zone for tighter SLAs.
-    return machine_score * 100 >= best_score * 75;
+    return total_memory;
 }
 
-bool MachineIsPreferredForCpu(const unordered_map<CPUType_t, uint64_t> & best_capacity_by_cpu,
-                              CPUType_t cpu_type,
-                              MachineId_t machine_id) {
-    auto best_it = best_capacity_by_cpu.find(cpu_type);
-    uint64_t best_score = (best_it == best_capacity_by_cpu.end()) ? 0 : best_it->second;
-    if(best_score == 0) {
-        return true;
-    }
-    return MachineCapacityScore(machine_id) * 100 >= best_score * 75;
+double MachineLoadScore(MachineId_t machine_id) {
+    MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+    double task_pressure = static_cast<double>(machine_info.active_tasks) /
+                           std::max(1u, machine_info.num_cpus);
+    double memory_pressure = static_cast<double>(machine_info.memory_used) /
+                             std::max(1u, machine_info.memory_size);
+    return std::max(task_pressure, memory_pressure);
 }
 
-unsigned CountPreferredMachinesForCpu(const vector<MachineId_t> & machines,
-                                      const unordered_map<CPUType_t, uint64_t> & best_capacity_by_cpu,
-                                      CPUType_t cpu_type,
-                                      bool hosting_sla0_only,
-                                      const unordered_map<MachineId_t, array<unsigned, NUM_SLAS>> & machine_sla_vm_counts) {
-    unsigned count = 0;
-    for(MachineId_t machine_id : machines) {
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        if(machine_info.cpu != cpu_type || !MachineIsPreferredForCpu(best_capacity_by_cpu, cpu_type, machine_id)) {
-            continue;
-        }
-        if(hosting_sla0_only) {
-            auto it = machine_sla_vm_counts.find(machine_id);
-            if(it == machine_sla_vm_counts.end() || it->second[SLA0] == 0) {
-                continue;
-            }
-        }
-        count++;
-    }
-    return count;
+double ProjectedLoadAfterAddingVm(MachineId_t machine_id, VMId_t vm_id) {
+    MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+    VMInfo_t vm_info = VM_GetInfo(vm_id);
+    unsigned vm_memory = EstimatedVmMemory(vm_id);
+    double projected_tasks = static_cast<double>(machine_info.active_tasks + vm_info.active_tasks.size()) /
+                             std::max(1u, machine_info.num_cpus);
+    double projected_memory = static_cast<double>(machine_info.memory_used + vm_memory) /
+                              std::max(1u, machine_info.memory_size);
+    return std::max(projected_tasks, projected_memory);
 }
 
-bool ShouldReservePreferredCapacityForSla1(const vector<MachineId_t> & machines,
-                                           const unordered_map<CPUType_t, uint64_t> & best_capacity_by_cpu,
-                                           const unordered_map<MachineId_t, array<unsigned, NUM_SLAS>> & machine_sla_vm_counts,
-                                           TaskId_t task_id,
-                                           MachineId_t machine_id) {
-    if(RequiredSLA(task_id) != SLA0 ||
-       !MachineIsPreferredForCpu(best_capacity_by_cpu, RequiredCPUType(task_id), machine_id)) {
+double ProjectedLoadAfterRemovingVm(MachineId_t machine_id, VMId_t vm_id) {
+    MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+    VMInfo_t vm_info = VM_GetInfo(vm_id);
+    unsigned vm_memory = EstimatedVmMemory(vm_id);
+    unsigned remaining_tasks = machine_info.active_tasks > vm_info.active_tasks.size() ?
+                               machine_info.active_tasks - static_cast<unsigned>(vm_info.active_tasks.size()) : 0;
+    unsigned remaining_memory = machine_info.memory_used > vm_memory ?
+                                machine_info.memory_used - vm_memory : 0;
+    double task_pressure = static_cast<double>(remaining_tasks) /
+                           std::max(1u, machine_info.num_cpus);
+    double memory_pressure = static_cast<double>(remaining_memory) /
+                             std::max(1u, machine_info.memory_size);
+    return std::max(task_pressure, memory_pressure);
+}
+
+bool ShouldReservePreferredCapacityForSla1(SLAType_t task_sla,
+                                           bool machine_is_preferred,
+                                           bool machine_already_hosts_sla0,
+                                           unsigned preferred_machines,
+                                           unsigned preferred_sla0_machines) {
+    if(task_sla != SLA0 || !machine_is_preferred) {
         return false;
     }
-
-    auto counts_it = machine_sla_vm_counts.find(machine_id);
-    bool machine_already_hosts_sla0 = counts_it != machine_sla_vm_counts.end() &&
-                                      counts_it->second[SLA0] > 0;
     if(machine_already_hosts_sla0) {
         return false;
     }
-
-    unsigned preferred_machines = CountPreferredMachinesForCpu(machines,
-                                                               best_capacity_by_cpu,
-                                                               RequiredCPUType(task_id),
-                                                               false,
-                                                               machine_sla_vm_counts);
     if(preferred_machines <= 1) {
         return false;
     }
 
     unsigned reserved_for_non_sla0 = max(1u, preferred_machines / kPreferredTierReserveDivisor);
-    unsigned sla0_machines = CountPreferredMachinesForCpu(machines,
-                                                          best_capacity_by_cpu,
-                                                          RequiredCPUType(task_id),
-                                                          true,
-                                                          machine_sla_vm_counts);
-    return sla0_machines + reserved_for_non_sla0 >= preferred_machines;
+    return preferred_sla0_machines + reserved_for_non_sla0 >= preferred_machines;
 }
 
 bool ShouldAvoidMixedSlaMachine(const unordered_map<MachineId_t, array<unsigned, NUM_SLAS>> & machine_sla_vm_counts,
@@ -130,11 +109,9 @@ bool ShouldAvoidMixedSlaMachine(const unordered_map<MachineId_t, array<unsigned,
     return false;
 }
 
-int PlacementBucket(const vector<MachineId_t> & machines,
-                    const unordered_map<CPUType_t, uint64_t> & best_capacity_by_cpu,
-                    const unordered_map<MachineId_t, array<unsigned, NUM_SLAS>> & machine_sla_vm_counts,
-                    TaskId_t task_id,
-                    MachineId_t machine_id,
+int PlacementBucket(bool machine_is_preferred,
+                    bool reserve_preferred_capacity,
+                    bool avoid_mixed_sla_machine,
                     bool is_overloaded,
                     bool is_protected) {
     int bucket = 0;
@@ -143,17 +120,13 @@ int PlacementBucket(const vector<MachineId_t> & machines,
     } else if(is_overloaded) {
         bucket += 2;
     }
-    if(!IsPreferredPerformanceTier(best_capacity_by_cpu, task_id, machine_id)) {
+    if(!machine_is_preferred) {
         bucket += 1;
     }
-    if(ShouldReservePreferredCapacityForSla1(machines,
-                                             best_capacity_by_cpu,
-                                             machine_sla_vm_counts,
-                                             task_id,
-                                             machine_id)) {
+    if(reserve_preferred_capacity) {
         bucket += 3;
     }
-    if(ShouldAvoidMixedSlaMachine(machine_sla_vm_counts, task_id, machine_id)) {
+    if(avoid_mixed_sla_machine) {
         bucket += 3;
     }
     return bucket;
@@ -193,35 +166,10 @@ double ProjectedLoad(MachineId_t machine_id, TaskId_t task_id, bool creating_vm)
     return std::max(projected_tasks, memory_pressure);
 }
 
-bool CanVmHostTask(VMId_t vm_id,
-                   TaskId_t task_id,
-                   const unordered_map<VMId_t, SLAType_t> & vm_slas,
-                   MachineId_t & machine_id_out,
-                   double & projected_load_out) {
-    VMInfo_t vm_info = VM_GetInfo(vm_id);
-    auto vm_sla_it = vm_slas.find(vm_id);
-    if(vm_info.cpu != RequiredCPUType(task_id) ||
-       vm_info.vm_type != RequiredVMType(task_id) ||
-       (vm_sla_it != vm_slas.end() && vm_sla_it->second != RequiredSLA(task_id)) ||
-       !IsMachineReady(vm_info.machine_id) ||
-       !HasMachineMemoryForTask(vm_info.machine_id, task_id, false)) {
-        return false;
-    }
-
-    machine_id_out = vm_info.machine_id;
-    projected_load_out = ProjectedLoad(vm_info.machine_id, task_id, false);
-    return true;
-}
-
 }  // namespace
 
 Scheduler::HostState Scheduler::ClassifyMachine(MachineId_t machine_id) const {
-    MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-    double task_pressure = static_cast<double>(machine_info.active_tasks) /
-                           std::max(1u, machine_info.num_cpus);
-    double memory_pressure = static_cast<double>(machine_info.memory_used) /
-                             std::max(1u, machine_info.memory_size);
-    double load_score = std::max(task_pressure, memory_pressure);
+    double load_score = MachineLoadScore(machine_id);
 
     if(load_score >= kOverloadThreshold) {
         return HostState::OVERLOADED;
@@ -242,33 +190,105 @@ void Scheduler::RefreshMachineStates() {
 bool Scheduler::TryPlaceTask(TaskId_t task_id, bool log_failure) {
     RefreshMachineStates();
     Priority_t priority = PriorityForTask(task_id);
+    CPUType_t required_cpu = RequiredCPUType(task_id);
+    VMType_t required_vm = RequiredVMType(task_id);
+    SLAType_t required_sla = RequiredSLA(task_id);
+    unsigned required_memory = GetTaskMemory(task_id);
     VMId_t best_existing_vm = numeric_limits<VMId_t>::max();
     int best_existing_bucket = numeric_limits<int>::max();
     double best_existing_load = numeric_limits<double>::max();
     Time_t now = Now();
+    unordered_map<MachineId_t, MachineInfo_t> machine_infos;
+    unordered_map<MachineId_t, bool> machine_is_preferred;
+    machine_infos.reserve(machines.size());
+    machine_is_preferred.reserve(machines.size());
+
+    unsigned preferred_machines = 0;
+    unsigned preferred_sla0_machines = 0;
+    for(MachineId_t machine_id : machines) {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+        machine_infos.emplace(machine_id, machine_info);
+
+        bool is_preferred = true;
+        auto best_it = best_capacity_by_cpu.find(required_cpu);
+        uint64_t best_score = (best_it == best_capacity_by_cpu.end()) ? 0 : best_it->second;
+        if((required_sla == SLA0 || required_sla == SLA1) &&
+           machine_info.cpu == required_cpu &&
+           best_score != 0) {
+            unsigned base_mips = machine_info.performance.empty() ? 0 : machine_info.performance[0];
+            uint64_t machine_score = static_cast<uint64_t>(machine_info.num_cpus) * base_mips;
+            is_preferred = machine_score * 100 >= best_score * 75;
+        }
+        machine_is_preferred[machine_id] = is_preferred;
+
+        if(machine_info.cpu == required_cpu && is_preferred) {
+            preferred_machines++;
+            auto counts_it = machine_sla_vm_counts.find(machine_id);
+            if(counts_it != machine_sla_vm_counts.end() && counts_it->second[SLA0] > 0) {
+                preferred_sla0_machines++;
+            }
+        }
+    }
+
+    auto has_machine_memory_for_task = [&](MachineId_t machine_id, bool creating_vm) {
+        const MachineInfo_t & machine_info = machine_infos.at(machine_id);
+        unsigned needed_memory = required_memory + (creating_vm ? VM_MEMORY_OVERHEAD : 0);
+        return machine_info.memory_used + needed_memory <= machine_info.memory_size;
+    };
+
+    auto projected_load = [&](MachineId_t machine_id, bool creating_vm) {
+        const MachineInfo_t & machine_info = machine_infos.at(machine_id);
+        double projected_tasks = static_cast<double>(machine_info.active_tasks + 1) /
+                                 std::max(1u, machine_info.num_cpus);
+        unsigned projected_memory = machine_info.memory_used + required_memory +
+                                    (creating_vm ? VM_MEMORY_OVERHEAD : 0);
+        double memory_pressure = static_cast<double>(projected_memory) /
+                                 std::max(1u, machine_info.memory_size);
+        return std::max(projected_tasks, memory_pressure);
+    };
+
+    auto placement_bucket_for_machine = [&](MachineId_t machine_id) {
+        auto counts_it = machine_sla_vm_counts.find(machine_id);
+        bool machine_already_hosts_sla0 = counts_it != machine_sla_vm_counts.end() &&
+                                          counts_it->second[SLA0] > 0;
+        bool reserve_preferred_capacity = ShouldReservePreferredCapacityForSla1(required_sla,
+                                                                               machine_is_preferred.at(machine_id),
+                                                                               machine_already_hosts_sla0,
+                                                                               preferred_machines,
+                                                                               preferred_sla0_machines);
+        bool avoid_mixed = ShouldAvoidMixedSlaMachine(machine_sla_vm_counts, task_id, machine_id);
+        return PlacementBucket(machine_is_preferred.at(machine_id),
+                               reserve_preferred_capacity,
+                               avoid_mixed,
+                               host_states[machine_id] == HostState::OVERLOADED,
+                               IsMachineProtected(machine_id, now));
+    };
 
     for(VMId_t vm_id : vms) {
-        MachineId_t machine_id = 0;
-        double projected_load = 0.0;
-        if(!CanVmHostTask(vm_id, task_id, vm_slas, machine_id, projected_load)) {
+        VMInfo_t vm_info = VM_GetInfo(vm_id);
+        auto vm_sla_it = vm_slas.find(vm_id);
+        if(vm_info.cpu != required_cpu ||
+           vm_info.vm_type != required_vm ||
+           (vm_sla_it != vm_slas.end() && vm_sla_it->second != required_sla) ||
+           migrating_vms.count(vm_id) != 0) {
             continue;
         }
+        MachineId_t machine_id = vm_info.machine_id;
+        const MachineInfo_t & machine_info = machine_infos.at(machine_id);
+        if(machine_info.s_state != S0 || !has_machine_memory_for_task(machine_id, false)) {
+            continue;
+        }
+        double vm_projected_load = projected_load(machine_id, false);
 
-        int bucket = PlacementBucket(machines,
-                                     best_capacity_by_cpu,
-                                     machine_sla_vm_counts,
-                                     task_id,
-                                     machine_id,
-                                     host_states[machine_id] == HostState::OVERLOADED,
-                                     IsMachineProtected(machine_id, now));
-        if(projected_load <= kOverloadThreshold) {
+        int bucket = placement_bucket_for_machine(machine_id);
+        if(vm_projected_load <= kOverloadThreshold) {
             bucket = max(0, bucket - 1);
         }
 
         if(bucket < best_existing_bucket ||
-           (bucket == best_existing_bucket && projected_load < best_existing_load)) {
+           (bucket == best_existing_bucket && vm_projected_load < best_existing_load)) {
             best_existing_bucket = bucket;
-            best_existing_load = projected_load;
+            best_existing_load = vm_projected_load;
             best_existing_vm = vm_id;
         }
     }
@@ -278,32 +298,26 @@ bool Scheduler::TryPlaceTask(TaskId_t task_id, bool log_failure) {
     double best_machine_load = numeric_limits<double>::max();
 
     for(MachineId_t machine_id : machines) {
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        if(machine_info.cpu != RequiredCPUType(task_id) || !IsMachineReady(machine_id)) {
+        const MachineInfo_t & machine_info = machine_infos.at(machine_id);
+        if(machine_info.cpu != required_cpu || machine_info.s_state != S0) {
             continue;
         }
-        if(!HasMachineMemoryForTask(machine_id, task_id, true)) {
+        if(!has_machine_memory_for_task(machine_id, true)) {
             SimOutput("Scheduler::NewTask(): Skipping machine " + to_string(machine_id) +
                       " for task " + to_string(task_id) + " due to memory pressure", 3);
             continue;
         }
 
-        double projected_load = ProjectedLoad(machine_id, task_id, true);
-        int bucket = PlacementBucket(machines,
-                                     best_capacity_by_cpu,
-                                     machine_sla_vm_counts,
-                                     task_id,
-                                     machine_id,
-                                     host_states[machine_id] == HostState::OVERLOADED,
-                                     IsMachineProtected(machine_id, now));
-        if(projected_load <= kOverloadThreshold) {
+        double machine_projected_load = projected_load(machine_id, true);
+        int bucket = placement_bucket_for_machine(machine_id);
+        if(machine_projected_load <= kOverloadThreshold) {
             bucket = max(0, bucket - 1);
         }
 
         if(bucket < best_machine_bucket ||
-           (bucket == best_machine_bucket && projected_load < best_machine_load)) {
+           (bucket == best_machine_bucket && machine_projected_load < best_machine_load)) {
             best_machine_bucket = bucket;
-            best_machine_load = projected_load;
+            best_machine_load = machine_projected_load;
             best_machine = machine_id;
         }
     }
@@ -500,6 +514,318 @@ void Scheduler::RetryWaitingTasks(Time_t now) {
     }
 }
 
+bool Scheduler::TryRelieveMachineOverload(MachineId_t best_source, Time_t now) {
+    if(!migrating_vms.empty()) {
+        return false;
+    }
+
+    if(best_source == numeric_limits<MachineId_t>::max() ||
+       IsMachineProtected(best_source, now)) {
+        return false;
+    }
+
+    double best_source_load = MachineLoadScore(best_source);
+
+    VMId_t best_vm = numeric_limits<VMId_t>::max();
+    MachineId_t best_destination = numeric_limits<MachineId_t>::max();
+    double best_reduced_load = best_source_load;
+    double best_destination_load = numeric_limits<double>::max();
+    unsigned best_vm_memory = numeric_limits<unsigned>::max();
+
+    for(VMId_t vm_id : vms) {
+        if(migrating_vms.count(vm_id) != 0) {
+            continue;
+        }
+
+        VMInfo_t vm_info = VM_GetInfo(vm_id);
+        if(vm_info.machine_id != best_source || vm_info.active_tasks.empty()) {
+            continue;
+        }
+
+        double reduced_source_load = ProjectedLoadAfterRemovingVm(best_source, vm_id);
+        if(reduced_source_load >= best_source_load) {
+            continue;
+        }
+
+        unsigned vm_memory = EstimatedVmMemory(vm_id);
+        MachineId_t candidate_destination = numeric_limits<MachineId_t>::max();
+        double candidate_destination_load = numeric_limits<double>::max();
+
+        for(MachineId_t machine_id : machines) {
+            if(machine_id == best_source) {
+                continue;
+            }
+
+            MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+            if(machine_info.cpu != vm_info.cpu ||
+               !IsMachineReady(machine_id) ||
+               host_states[machine_id] == HostState::OVERLOADED ||
+               IsMachineProtected(machine_id, now) ||
+               machine_info.memory_used + vm_memory > machine_info.memory_size) {
+                continue;
+            }
+
+            double projected_destination_load = ProjectedLoadAfterAddingVm(machine_id, vm_id);
+            if(projected_destination_load >= kOverloadThreshold) {
+                continue;
+            }
+
+            if(projected_destination_load < candidate_destination_load) {
+                candidate_destination_load = projected_destination_load;
+                candidate_destination = machine_id;
+            }
+        }
+
+        if(candidate_destination == numeric_limits<MachineId_t>::max()) {
+            continue;
+        }
+
+        if(reduced_source_load < best_reduced_load ||
+           (reduced_source_load == best_reduced_load && candidate_destination_load < best_destination_load) ||
+           (reduced_source_load == best_reduced_load && candidate_destination_load == best_destination_load &&
+            vm_memory < best_vm_memory)) {
+            best_reduced_load = reduced_source_load;
+            best_destination_load = candidate_destination_load;
+            best_vm_memory = vm_memory;
+            best_vm = vm_id;
+            best_destination = candidate_destination;
+        }
+    }
+
+    if(best_vm == numeric_limits<VMId_t>::max()) {
+        return false;
+    }
+
+    migrating_vms.insert(best_vm);
+    migration_sources[best_vm] = best_source;
+    migration_destinations[best_vm] = best_destination;
+    VM_Migrate(best_vm, best_destination);
+    SimOutput("Scheduler::MaybeRelieveOverload(): migrating VM " + to_string(best_vm) +
+              " from machine " + to_string(best_source) +
+              " to machine " + to_string(best_destination) +
+              " source_load=" + to_string(best_source_load) +
+              " reduced_load=" + to_string(best_reduced_load), 1);
+    return true;
+}
+
+void Scheduler::MaybeRelieveOverload(Time_t now) {
+    MachineId_t best_source = numeric_limits<MachineId_t>::max();
+    double best_source_load = kMigrationTriggerThreshold;
+    for(MachineId_t machine_id : machines) {
+        double source_load = MachineLoadScore(machine_id);
+        if(host_states[machine_id] != HostState::OVERLOADED ||
+           source_load < kMigrationTriggerThreshold ||
+           IsMachineProtected(machine_id, now)) {
+            continue;
+        }
+        if(source_load > best_source_load) {
+            best_source_load = source_load;
+            best_source = machine_id;
+        }
+    }
+
+    TryRelieveMachineOverload(best_source, now);
+}
+
+void Scheduler::MaybeEvacuateUnderload(Time_t now) {
+    if(!kEnableUnderloadEvacuation) {
+        return;
+    }
+    if(!migrating_vms.empty()) {
+        return;
+    }
+
+    auto source_is_still_valid = [&](MachineId_t machine_id) {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+        return host_states[machine_id] == HostState::UNDERLOADED &&
+               machine_info.active_vms > 0 &&
+               machine_info.s_state == S0 &&
+               !IsMachineProtected(machine_id, now);
+    };
+
+    if(evacuating_machine.has_value() && !source_is_still_valid(*evacuating_machine)) {
+        evacuating_machine.reset();
+    }
+
+    if(!evacuating_machine.has_value()) {
+        MachineId_t best_source = numeric_limits<MachineId_t>::max();
+        double best_source_load = numeric_limits<double>::max();
+        for(MachineId_t machine_id : machines) {
+            if(!source_is_still_valid(machine_id)) {
+                continue;
+            }
+
+            double source_load = MachineLoadScore(machine_id);
+            if(source_load < best_source_load) {
+                best_source_load = source_load;
+                best_source = machine_id;
+            }
+        }
+
+        if(best_source == numeric_limits<MachineId_t>::max()) {
+            return;
+        }
+        evacuating_machine = best_source;
+    }
+
+    MachineId_t source = *evacuating_machine;
+    vector<VMId_t> source_vms;
+    for(VMId_t vm_id : vms) {
+        if(migrating_vms.count(vm_id) != 0) {
+            continue;
+        }
+        VMInfo_t vm_info = VM_GetInfo(vm_id);
+        if(vm_info.machine_id == source && !vm_info.active_tasks.empty()) {
+            source_vms.push_back(vm_id);
+        }
+    }
+
+    if(source_vms.empty()) {
+        evacuating_machine.reset();
+        return;
+    }
+
+    sort(source_vms.begin(), source_vms.end(), [](VMId_t lhs, VMId_t rhs) {
+        return EstimatedVmMemory(lhs) > EstimatedVmMemory(rhs);
+    });
+
+    unordered_map<MachineId_t, unsigned> simulated_tasks;
+    unordered_map<MachineId_t, unsigned> simulated_memory;
+    auto simulated_sla_counts = machine_sla_vm_counts;
+    for(MachineId_t machine_id : machines) {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+        simulated_tasks[machine_id] = machine_info.active_tasks;
+        simulated_memory[machine_id] = machine_info.memory_used;
+    }
+
+    vector<pair<VMId_t, MachineId_t>> migration_plan;
+
+    for(VMId_t vm_id : source_vms) {
+        VMInfo_t vm_info = VM_GetInfo(vm_id);
+        SLAType_t vm_sla = vm_slas[vm_id];
+        unsigned vm_memory = EstimatedVmMemory(vm_id);
+        unsigned vm_task_count = static_cast<unsigned>(vm_info.active_tasks.size());
+
+        MachineId_t best_destination = numeric_limits<MachineId_t>::max();
+        int best_bucket = numeric_limits<int>::max();
+        double best_destination_load = numeric_limits<double>::max();
+
+        for(MachineId_t machine_id : machines) {
+            if(machine_id == source ||
+               pending_state_changes.count(machine_id) != 0 ||
+               IsMachineProtected(machine_id, now)) {
+                continue;
+            }
+
+            MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+            if(machine_info.cpu != vm_info.cpu ||
+               machine_info.s_state != S0 ||
+               host_states[machine_id] == HostState::OVERLOADED) {
+                continue;
+            }
+
+            if(simulated_memory[machine_id] + vm_memory > machine_info.memory_size) {
+                continue;
+            }
+
+            double projected_task_pressure = static_cast<double>(simulated_tasks[machine_id] + vm_task_count) /
+                                             std::max(1u, machine_info.num_cpus);
+            double projected_memory_pressure = static_cast<double>(simulated_memory[machine_id] + vm_memory) /
+                                               std::max(1u, machine_info.memory_size);
+            double projected_load = std::max(projected_task_pressure, projected_memory_pressure);
+            if(projected_load >= kOverloadThreshold) {
+                continue;
+            }
+
+            TaskId_t representative_task = vm_info.active_tasks.front();
+            SLAType_t representative_sla = RequiredSLA(representative_task);
+            bool machine_is_preferred = true;
+            auto best_it = best_capacity_by_cpu.find(vm_info.cpu);
+            uint64_t best_score = (best_it == best_capacity_by_cpu.end()) ? 0 : best_it->second;
+            if((representative_sla == SLA0 || representative_sla == SLA1) && best_score != 0) {
+                unsigned base_mips = machine_info.performance.empty() ? 0 : machine_info.performance[0];
+                uint64_t machine_score = static_cast<uint64_t>(machine_info.num_cpus) * base_mips;
+                machine_is_preferred = machine_score * 100 >= best_score * 75;
+            }
+
+            unsigned preferred_machines = 0;
+            unsigned preferred_sla0_machines = 0;
+            for(MachineId_t candidate : machines) {
+                MachineInfo_t candidate_info = Machine_GetInfo(candidate);
+                if(candidate_info.cpu != vm_info.cpu) {
+                    continue;
+                }
+                unsigned candidate_mips = candidate_info.performance.empty() ? 0 : candidate_info.performance[0];
+                uint64_t candidate_score = static_cast<uint64_t>(candidate_info.num_cpus) * candidate_mips;
+                bool candidate_is_preferred = best_score == 0 || candidate_score * 100 >= best_score * 75;
+                if(!candidate_is_preferred) {
+                    continue;
+                }
+                preferred_machines++;
+                auto counts_it = simulated_sla_counts.find(candidate);
+                if(counts_it != simulated_sla_counts.end() && counts_it->second[SLA0] > 0) {
+                    preferred_sla0_machines++;
+                }
+            }
+
+            auto counts_it = simulated_sla_counts.find(machine_id);
+            bool machine_already_hosts_sla0 = counts_it != simulated_sla_counts.end() &&
+                                              counts_it->second[SLA0] > 0;
+            int bucket = PlacementBucket(machine_is_preferred,
+                                         ShouldReservePreferredCapacityForSla1(representative_sla,
+                                                                              machine_is_preferred,
+                                                                              machine_already_hosts_sla0,
+                                                                              preferred_machines,
+                                                                              preferred_sla0_machines),
+                                         ShouldAvoidMixedSlaMachine(simulated_sla_counts,
+                                                                    representative_task,
+                                                                    machine_id),
+                                         false,
+                                         false);
+
+            if(bucket < best_bucket ||
+               (bucket == best_bucket && projected_load < best_destination_load)) {
+                best_bucket = bucket;
+                best_destination_load = projected_load;
+                best_destination = machine_id;
+            }
+        }
+
+        if(best_destination == numeric_limits<MachineId_t>::max()) {
+            evacuating_machine.reset();
+            return;
+        }
+
+        migration_plan.push_back({vm_id, best_destination});
+        simulated_tasks[source] = simulated_tasks[source] > vm_task_count ?
+                                  simulated_tasks[source] - vm_task_count : 0;
+        simulated_memory[source] = simulated_memory[source] > vm_memory ?
+                                   simulated_memory[source] - vm_memory : 0;
+        if(simulated_sla_counts[source][vm_sla] > 0) {
+            simulated_sla_counts[source][vm_sla]--;
+        }
+        simulated_tasks[best_destination] += vm_task_count;
+        simulated_memory[best_destination] += vm_memory;
+        simulated_sla_counts[best_destination][vm_sla]++;
+    }
+
+    if(migration_plan.empty()) {
+        evacuating_machine.reset();
+        return;
+    }
+
+    VMId_t vm_id = migration_plan.front().first;
+    MachineId_t destination = migration_plan.front().second;
+    migrating_vms.insert(vm_id);
+    migration_sources[vm_id] = source;
+    migration_destinations[vm_id] = destination;
+    VM_Migrate(vm_id, destination);
+    SimOutput("Scheduler::MaybeEvacuateUnderload(): evacuating machine " + to_string(source) +
+              " by migrating VM " + to_string(vm_id) +
+              " to machine " + to_string(destination) +
+              " remaining_vms=" + to_string(source_vms.size()), 1);
+}
+
 void Scheduler::Init() {
     // Find the parameters of the clusters
     // Get the total number of machines
@@ -510,7 +836,11 @@ void Scheduler::Init() {
     //      Get if there is a GPU or not
     // 
     unsigned total_machines = Machine_GetTotal();
+    total_tasks = GetNumTasks();
+    completed_tasks = 0;
+    next_progress_percent = 10;
     SimOutput("Scheduler::Init(): Total number of machines is " + to_string(total_machines), 3);
+    SimOutput("Scheduler::Init(): Total number of tasks is " + to_string(total_tasks), 2);
     SimOutput("Scheduler::Init(): Initializing scheduler", 1);
     for(unsigned i = 0; i < total_machines; i++) {
         machines.push_back(MachineId_t(i));
@@ -530,7 +860,44 @@ void Scheduler::Init() {
 }
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
-    // Update your data structure. The VM now can receive new tasks
+    auto source_it = migration_sources.find(vm_id);
+    auto destination_it = migration_destinations.find(vm_id);
+    auto vm_sla_it = vm_slas.find(vm_id);
+
+    if(source_it != migration_sources.end() &&
+       destination_it != migration_destinations.end() &&
+       vm_sla_it != vm_slas.end()) {
+        SLAType_t vm_sla = vm_sla_it->second;
+        if(machine_sla_vm_counts[source_it->second][vm_sla] > 0) {
+            machine_sla_vm_counts[source_it->second][vm_sla]--;
+        }
+        machine_sla_vm_counts[destination_it->second][vm_sla]++;
+    }
+
+    migrating_vms.erase(vm_id);
+    migration_sources.erase(vm_id);
+    migration_destinations.erase(vm_id);
+
+    if(find(vms.begin(), vms.end(), vm_id) != vms.end()) {
+        VMInfo_t vm_info = VM_GetInfo(vm_id);
+        if(vm_info.active_tasks.empty()) {
+            if(vm_sla_it != vm_slas.end()) {
+                auto machine_counts_it = machine_sla_vm_counts.find(vm_info.machine_id);
+                if(machine_counts_it != machine_sla_vm_counts.end() &&
+                   machine_counts_it->second[vm_sla_it->second] > 0) {
+                    machine_counts_it->second[vm_sla_it->second]--;
+                }
+            }
+            VM_Shutdown(vm_id);
+            vms.erase(remove(vms.begin(), vms.end(), vm_id), vms.end());
+            vm_slas.erase(vm_id);
+        }
+    }
+
+    RefreshMachineStates();
+    MaybeRelieveOverload(time);
+    MaybeEvacuateUnderload(time);
+    RetryWaitingTasks(time);
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
@@ -566,6 +933,8 @@ void Scheduler::PeriodicCheck(Time_t now) {
     // Unlike the other invocations of the scheduler, this one doesn't report any specific event
     // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
     RefreshMachineStates();
+    MaybeRelieveOverload(now);
+    MaybeEvacuateUnderload(now);
     for(MachineId_t machine_id : machines) {
         MaybeSleepMachine(machine_id, now);
     }
@@ -588,13 +957,49 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     // Do any bookkeeping necessary for the data structures
     // Decide if a machine is to be turned off, slowed down, or VMs to be migrated according to your policy
     // This is an opportunity to make any adjustments to optimize performance/energy
+    if(completed_tasks < total_tasks) {
+        completed_tasks++;
+    }
+    if(total_tasks > 0) {
+        unsigned progress_percent = (completed_tasks * 100) / total_tasks;
+        while(next_progress_percent <= 100 && progress_percent >= next_progress_percent) {
+            SimOutput("Scheduler::Progress(): " + to_string(next_progress_percent) +
+                      "% complete (" + to_string(completed_tasks) + "/" +
+                      to_string(total_tasks) + " tasks) at time " + to_string(now), 0);
+            next_progress_percent += 10;
+        }
+    }
+
     auto vm_it = task_to_vm.find(task_id);
     if(vm_it != task_to_vm.end()) {
         VMId_t vm_id = vm_it->second;
         task_to_vm.erase(vm_it);
 
+        if(find(vms.begin(), vms.end(), vm_id) == vms.end()) {
+            RetryWaitingTasks(now);
+            SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) +
+                      " completed after VM " + to_string(vm_id) +
+                      " was already retired", 2);
+            return;
+        }
+
         VMInfo_t vm_info = VM_GetInfo(vm_id);
         if(vm_info.active_tasks.empty()) {
+            if(migrating_vms.count(vm_id) != 0) {
+                RetryWaitingTasks(now);
+                SimOutput("Scheduler::TaskComplete(): VM " + to_string(vm_id) +
+                          " is empty but still migrating, deferring shutdown", 2);
+                return;
+            }
+            // Multiple task completions can arrive back-to-back for the same VM.
+            // Once the VM is empty, clear every remaining stale task->VM mapping first.
+            for(auto it = task_to_vm.begin(); it != task_to_vm.end(); ) {
+                if(it->second == vm_id) {
+                    it = task_to_vm.erase(it);
+                } else {
+                    ++it;
+                }
+            }
             auto vm_sla_it = vm_slas.find(vm_id);
             if(vm_sla_it != vm_slas.end()) {
                 auto machine_counts_it = machine_sla_vm_counts.find(vm_info.machine_id);
@@ -606,7 +1011,6 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
             VM_Shutdown(vm_id);
             vms.erase(remove(vms.begin(), vms.end(), vm_id), vms.end());
             vm_slas.erase(vm_id);
-            SimOutput("Scheduler::TaskComplete(): Shut down empty VM " + to_string(vm_id), 2);
         }
     }
 
@@ -641,6 +1045,21 @@ void Scheduler::HandleSLAWarning(Time_t time, TaskId_t task_id) {
     TryWakeMachineForTask(task_id);
 }
 
+void Scheduler::HandleMemoryWarning(Time_t time, MachineId_t machine_id) {
+    ProtectMachine(machine_id, time);
+    RefreshMachineStates();
+
+    if(TryRelieveMachineOverload(machine_id, time)) {
+        SimOutput("Scheduler::HandleMemoryWarning(): triggered overload relief for machine " +
+                  to_string(machine_id) + " at time " + to_string(time), 1);
+    } else {
+        SimOutput("Scheduler::HandleMemoryWarning(): no safe migration found for machine " +
+                  to_string(machine_id) + " at time " + to_string(time), 2);
+    }
+
+    RetryWaitingTasks(time);
+}
+
 // Public interface below
 
 static Scheduler Scheduler;
@@ -662,7 +1081,7 @@ void HandleTaskCompletion(Time_t time, TaskId_t task_id) {
 
 void MemoryWarning(Time_t time, MachineId_t machine_id) {
     // The simulator is alerting you that machine identified by machine_id is overcommitted
-    SimOutput("MemoryWarning(): Overflow at " + to_string(machine_id) + " was detected at time " + to_string(time), 0);
+    Scheduler.HandleMemoryWarning(time, machine_id);
 }
 
 void MigrationDone(Time_t time, VMId_t vm_id) {

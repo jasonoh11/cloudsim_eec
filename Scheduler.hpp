@@ -10,6 +10,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -25,6 +26,7 @@ public:
     void PeriodicCheck(Time_t now);
     void Shutdown(Time_t now);
     void HandleSLAWarning(Time_t time, TaskId_t task_id);
+    void HandleMemoryWarning(Time_t time, MachineId_t machine_id);
     void StateChangeFinished(Time_t time, MachineId_t machine_id);
     void TaskComplete(Time_t now, TaskId_t task_id);
 private:
@@ -41,6 +43,9 @@ private:
     void ProtectMachine(MachineId_t machine_id, Time_t now);
     bool IsMachineProtected(MachineId_t machine_id, Time_t now) const;
     void MaybeSleepMachine(MachineId_t machine_id, Time_t now);
+    bool TryRelieveMachineOverload(MachineId_t machine_id, Time_t now);
+    void MaybeRelieveOverload(Time_t now);
+    void MaybeEvacuateUnderload(Time_t now);
     void RetryWaitingTasks(Time_t now);
     unsigned CountReadyMachines(CPUType_t cpu_type, MachineId_t exclude_machine) const;
 
@@ -51,9 +56,16 @@ private:
     unordered_map<VMId_t, SLAType_t> vm_slas;
     unordered_map<CPUType_t, uint64_t> best_capacity_by_cpu;
     unordered_map<MachineId_t, array<unsigned, NUM_SLAS>> machine_sla_vm_counts;
+    optional<MachineId_t> evacuating_machine;
+    unordered_set<VMId_t> migrating_vms;
+    unordered_map<VMId_t, MachineId_t> migration_sources;
+    unordered_map<VMId_t, MachineId_t> migration_destinations;
     unordered_set<MachineId_t> pending_state_changes;
     unordered_map<MachineId_t, HostState> host_states;
     unordered_map<MachineId_t, Time_t> protected_until;
+    unsigned total_tasks = 0;
+    unsigned completed_tasks = 0;
+    unsigned next_progress_percent = 10;
 };
 
 
