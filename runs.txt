@@ -1,0 +1,78 @@
+Current simulator results for all inputs in `tmp/`
+
+tmp/Input
+SLA0: 0%
+SLA1: 0%
+SLA2: 0%
+Total Energy: 0.000376157 KW-Hour
+Simulation run finished in: 3.12 seconds
+
+tmp/big_small
+SLA0: 0%
+SLA1: 7.31707%
+SLA2: 0%
+Total Energy: 0.0300047 KW-Hour
+Simulation run finished in: 30.9 seconds
+
+tmp/canvas
+SLA0: 0%
+SLA1: 0%
+SLA2: 0.0990634%
+Total Energy: 2.08854 KW-Hour
+Simulation run finished in: 3603.48 seconds
+
+tmp/day
+SLA0: 0%
+SLA1: 0%
+SLA2: 0%
+Total Energy: 18.7799 KW-Hour
+Simulation run finished in: 86401.1 seconds
+
+tmp/gentler_hour
+SLA0: 0%
+SLA1: 0%
+SLA2: 0%
+Total Energy: 2.04098 KW-Hour
+Simulation run finished in: 3603.48 seconds
+
+tmp/match
+SLA0: 0%
+SLA1: 0%
+SLA2: 0%
+Total Energy: 0.0447712 KW-Hour
+Simulation run finished in: 18.24 seconds
+
+tmp/nice_smooth
+SLA0: 0%
+SLA1: 0%
+SLA2: 0%
+Total Energy: 0.0123523 KW-Hour
+Simulation run finished in: 16.68 seconds
+
+tmp/spikey_mean
+SLA0: 0%
+SLA1: 6.09756%
+SLA2: 0%
+Total Energy: 0.0250566 KW-Hour
+Simulation run finished in: 28.08 seconds
+
+tmp/spikey_nefarious
+SLA0: 0%
+SLA1: 0%
+SLA2: 0%
+Total Energy: 0.0116119 KW-Hour
+Simulation run finished in: 16.32 seconds
+
+tmp/submitted_input
+SLA0: 0%
+SLA1: 0%
+SLA2: 0%
+Total Energy: 0.0126295 KW-Hour
+Simulation run finished in: 17.58 seconds
+
+tmp/tall_short
+SLA0: 51.9471%
+SLA1: 4.87805%
+SLA2: 0%
+Total Energy: 0.0350479 KW-Hour
+Simulation run finished in: 34.44 seconds

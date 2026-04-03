@@ -15,7 +15,7 @@ OBJ = $(SRC:.cpp=.o)
 TARGET = simulator
 
 run-0:
-	./simulator -v 0 ./tmp/tall_short
+	./simulator -v 0 ./tmp/canvas
 
 run-1:
 	./simulator -v 1 ./tmp/canvas
