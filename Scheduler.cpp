@@ -206,7 +206,7 @@ bool Scheduler::FindBestMigrationTarget(VMId_t vm_id, MachineId_t &target_machin
 
         const unsigned projected_used = machine.tracked_memory_used + migration_footprint;
         const double projected_utilization = static_cast<double>(projected_used) / static_cast<double>(machine.memory_capacity);
-        if(projected_utilization >= kCapacityCap) {
+        if(projected_utilization >= kCapacityCap || projected_utilization > kMigrationTargetMaxUtilization) {
             continue;
         }
 
@@ -246,6 +246,17 @@ bool Scheduler::TryMigrateAtRiskTask(TaskId_t task_id, Time_t now, bool allow_wa
     }
 
     if(!IsTaskAtRisk(task_id, now)) {
+        return false;
+    }
+
+    const TaskInfo_t info = GetTaskInfo(task_id);
+    const uint64_t window = (info.target_completion > info.arrival) ? (info.target_completion - info.arrival) : 0;
+    if(window == 0) {
+        return false;
+    }
+
+    const uint64_t remaining = (info.target_completion > now) ? (info.target_completion - now) : 0;
+    if((remaining * 100ULL) > (window * static_cast<uint64_t>(kMigrationUrgencyRemainingRatio * 100.0))) {
         return false;
     }
 
@@ -532,14 +543,14 @@ void Scheduler::PeriodicCheck(Time_t now) {
     // MVP phase 8: Refresh dynamic machine state before processing retries to reduce stale-state effects.
     RefreshMachineStatesFromSimulator();
     RefreshProtectedMachines(now);
-    ProcessAtRiskMigrations(now);
     ProcessRetryQueue(now);
 }
 
 void Scheduler::SLAWarn(Time_t now, TaskId_t task_id) {
     RefreshMachineStatesFromSimulator();
     RefreshProtectedMachines(now);
-    (void)TryMigrateAtRiskTask(task_id, now, true);
+    (void)task_id;
+    (void)now;
 }
 
 void Scheduler::Shutdown(Time_t time) {

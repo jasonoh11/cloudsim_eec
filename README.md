@@ -179,6 +179,22 @@ Use heartbeat checks on latest log:
 - if simulated time and completion counts increase, it is progressing;
 - if both are flat for a long interval, inspect retry behavior and queue dynamics.
 
+## Final Policy Decision
+
+After comparing several migration experiments against the protection-only baseline on `Spikey Mean`, the active policy is now:
+
+1. `kCapacityCap = 0.70` for additional headroom.
+2. Proactive host protection for at-risk tasks.
+3. No active migration in the default path.
+
+Why:
+
+- Protection plus headroom consistently performed better than migration variants on the tested burst trace.
+- Migration added churn without improving SLA enough to justify keeping it in the active path.
+- The migration helpers remain in the code for future experimentation, but they are not part of the default policy.
+
+Tracked comparisons are maintained in [SLA_RUN_TRACKER.md](SLA_RUN_TRACKER.md).
+
 ## Known Scope / Non-Goals (Current Implementation)
 
 Not currently implemented as active policy logic:

@@ -69,10 +69,12 @@ private:
         TaskId_t task_id;
     };
 
-    static constexpr double kCapacityCap = 0.80;
+    static constexpr double kCapacityCap = 0.70;
     static constexpr unsigned kMaxRetriesPerTask = 3;
     static constexpr unsigned kMaxMigrationsPerTick = 2;
-    static constexpr Time_t kMigrationCooldown = 2000000;
+    static constexpr Time_t kMigrationCooldown = 10000000;
+    static constexpr double kMigrationTargetMaxUtilization = 0.45;
+    static constexpr double kMigrationUrgencyRemainingRatio = 0.10;
 
     void InitializeMachineViews();
     void RefreshMachineStatesFromSimulator();
