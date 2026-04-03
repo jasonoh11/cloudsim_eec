@@ -58,6 +58,7 @@ private:
         bool gpu_capable;
         Priority_t assigned_priority;
         bool assigned;
+        bool completed;
         VMId_t assigned_vm;
         unsigned retry_count;
         bool placement_failed;
@@ -91,6 +92,7 @@ private:
 
     // Reporting counters (filled in later phases).
     unsigned tasks_seen = 0;
+    unsigned tasks_completed = 0;
     unsigned successful_placements = 0;
     unsigned retry_enqueues = 0;
     unsigned retry_attempts = 0;

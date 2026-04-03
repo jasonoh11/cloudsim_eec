@@ -119,7 +119,7 @@ bool Scheduler::TryPlaceTask(TaskId_t task_id) {
         return false;
     }
 
-    if(task_it->second.placement_failed || task_it->second.assigned) {
+    if(task_it->second.placement_failed || task_it->second.assigned || task_it->second.completed) {
         return false;
     }
 
@@ -220,6 +220,7 @@ void Scheduler::Init() {
 
     //RESET SCHEDULER REPORTING COUNTERS
     tasks_seen = 0;
+    tasks_completed = 0;
     successful_placements = 0;
     retry_enqueues = 0;
     retry_attempts = 0;
@@ -282,6 +283,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         IsTaskGPUCapable(task_id),
         priority,
         false,
+        false,
         VMId_t(-1),
         0,
         false
@@ -319,6 +321,66 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     // Decide if a machine is to be turned off, slowed down, or VMs to be migrated according to your policy
     // This is an opportunity to make any adjustments to optimize performance/energy
     SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " is complete at " + to_string(now), 4);
+
+    auto task_it = task_states.find(task_id);
+    if(task_it == task_states.end()) {
+        return;
+    }
+
+    if(task_it->second.completed) {
+        return;
+    }
+
+    task_it->second.completed = true;
+    tasks_completed++;
+
+    if(!task_it->second.assigned) {
+        return;
+    }
+
+    const VMId_t vm_id = task_it->second.assigned_vm;
+    auto vm_it = vm_states.find(vm_id);
+    if(vm_it == vm_states.end()) {
+        task_it->second.assigned = false;
+        task_it->second.assigned_vm = VMId_t(-1);
+        task_to_vm.erase(task_id);
+        return;
+    }
+
+    VMState &vm_state = vm_it->second;
+    vm_state.active_tasks.erase(task_id);
+    if(vm_state.tracked_memory_footprint >= task_it->second.required_memory) {
+        vm_state.tracked_memory_footprint -= task_it->second.required_memory;
+    } else {
+        vm_state.tracked_memory_footprint = 0;
+    }
+
+    auto machine_it = machine_views.find(vm_state.machine_id);
+    if(machine_it != machine_views.end()) {
+        MachineStateView &machine = machine_it->second;
+        if(machine.active_task_count > 0) {
+            machine.active_task_count--;
+        }
+        if(machine.tracked_memory_used >= task_it->second.required_memory) {
+            machine.tracked_memory_used -= task_it->second.required_memory;
+        } else {
+            machine.tracked_memory_used = 0;
+        }
+    }
+
+    task_to_vm.erase(task_id);
+    task_it->second.assigned = false;
+    task_it->second.assigned_vm = VMId_t(-1);
+
+    if(vm_state.active_tasks.empty() && !vm_state.migrating) {
+        VM_Shutdown(vm_id);
+
+        if(machine_it != machine_views.end()) {
+            machine_it->second.active_vms.erase(vm_id);
+        }
+
+        vm_states.erase(vm_it);
+    }
 }
 
 // Public interface below
