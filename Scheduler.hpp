@@ -68,6 +68,7 @@ private:
     };
 
     static constexpr double kCapacityCap = 0.80;
+    static constexpr unsigned kMaxRetriesPerTask = 3;
 
     void InitializeMachineViews();
     void RefreshMachineStatesFromSimulator();
@@ -75,6 +76,9 @@ private:
     unsigned AdditionalPlacementMemory(TaskId_t task_id, bool creating_vm) const;
     bool IsMachineFeasible(TaskId_t task_id, MachineId_t machine_id, bool creating_vm) const;
     bool HasReusableVM(MachineId_t machine_id, VMType_t required_vm, CPUType_t required_cpu, VMId_t &vm_id) const;
+    bool TryPlaceTask(TaskId_t task_id);
+    void EnqueueRetry(TaskId_t task_id);
+    void ProcessRetryQueue(Time_t now);
 
     vector<MachineId_t> machines;
 

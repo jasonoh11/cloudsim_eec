@@ -113,6 +113,91 @@ bool Scheduler::HasReusableVM(MachineId_t machine_id, VMType_t required_vm, CPUT
     return false;
 }
 
+bool Scheduler::TryPlaceTask(TaskId_t task_id) {
+    const auto task_it = task_states.find(task_id);
+    if(task_it == task_states.end()) {
+        return false;
+    }
+
+    if(task_it->second.placement_failed || task_it->second.assigned) {
+        return false;
+    }
+
+    const CPUType_t required_cpu = task_it->second.required_cpu;
+    const VMType_t required_vm = task_it->second.required_vm;
+    const Priority_t priority = task_it->second.assigned_priority;
+
+    for(const auto machine_id : machines) {
+        VMId_t vm_id = VMId_t(-1);
+        const bool has_reusable_vm = HasReusableVM(machine_id, required_vm, required_cpu, vm_id);
+        const bool creating_vm = !has_reusable_vm;
+
+        if(!IsMachineFeasible(task_id, machine_id, creating_vm)) {
+            continue;
+        }
+
+        if(!has_reusable_vm) {
+            vm_id = VM_Create(required_vm, required_cpu);
+            VM_Attach(vm_id, machine_id);
+            vm_states[vm_id] = VMState{vm_id, machine_id, required_vm, required_cpu, false, {}, VM_MEMORY_OVERHEAD};
+            machine_views[machine_id].active_vms.insert(vm_id);
+            machine_views[machine_id].tracked_memory_used += VM_MEMORY_OVERHEAD;
+            vms_created++;
+        }
+
+        VM_AddTask(vm_id, task_id, priority);
+        task_to_vm[task_id] = vm_id;
+        vm_states[vm_id].active_tasks.insert(task_id);
+        vm_states[vm_id].tracked_memory_footprint += task_it->second.required_memory;
+        machine_views[machine_id].tracked_memory_used += task_it->second.required_memory;
+        machine_views[machine_id].active_task_count++;
+        task_it->second.assigned = true;
+        task_it->second.assigned_vm = vm_id;
+        successful_placements++;
+        return true;
+    }
+
+    return false;
+}
+
+void Scheduler::EnqueueRetry(TaskId_t task_id) {
+    retry_queue.push_back({task_id});
+    retry_enqueues++;
+}
+
+void Scheduler::ProcessRetryQueue(Time_t now) {
+    const size_t queue_snapshot_size = retry_queue.size();
+    for(size_t i = 0; i < queue_snapshot_size; i++) {
+        const RetryEntry entry = retry_queue.front();
+        retry_queue.pop_front();
+
+        auto task_it = task_states.find(entry.task_id);
+        if(task_it == task_states.end()) {
+            continue;
+        }
+
+        if(task_it->second.placement_failed || task_it->second.assigned) {
+            continue;
+        }
+
+        retry_attempts++;
+        if(TryPlaceTask(entry.task_id)) {
+            continue;
+        }
+
+        task_it->second.retry_count++;
+        if(task_it->second.retry_count >= kMaxRetriesPerTask) {
+            task_it->second.placement_failed = true;
+            placement_failures++;
+            failed_task_ids.push_back(entry.task_id);
+            SimOutput("Scheduler::ProcessRetryQueue(): task " + to_string(entry.task_id) + " failed placement at time " + to_string(now), 1);
+            continue;
+        }
+
+        retry_queue.push_back(entry);
+    }
+}
+
 void Scheduler::Init() {
     // Find the parameters of the clusters
     // Get the total number of machines
@@ -202,40 +287,11 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         false
     };
 
-    for(const auto machine_id : machines) {
-        VMId_t vm_id = VMId_t(-1);
-        const bool has_reusable_vm = HasReusableVM(machine_id, required_vm, required_cpu, vm_id);
-        const bool creating_vm = !has_reusable_vm;
-
-        if(!IsMachineFeasible(task_id, machine_id, creating_vm)) {
-            continue;
-        }
-
-        if(!has_reusable_vm) {
-            vm_id = VM_Create(required_vm, required_cpu);
-            VM_Attach(vm_id, machine_id);
-            vm_states[vm_id] = VMState{vm_id, machine_id, required_vm, required_cpu, false, {}, VM_MEMORY_OVERHEAD};
-            machine_views[machine_id].active_vms.insert(vm_id);
-            machine_views[machine_id].tracked_memory_used += VM_MEMORY_OVERHEAD;
-            vms_created++;
-        }
-
-        VM_AddTask(vm_id, task_id, priority);
-        task_to_vm[task_id] = vm_id;
-        vm_states[vm_id].active_tasks.insert(task_id);
-        vm_states[vm_id].tracked_memory_footprint += task_states[task_id].required_memory;
-        machine_views[machine_id].tracked_memory_used += task_states[task_id].required_memory;
-        machine_views[machine_id].active_task_count++;
-        task_states[task_id].assigned = true;
-        task_states[task_id].assigned_vm = vm_id;
-        tasks_seen++;
-        successful_placements++;
-        return;
-    }
-
-    retry_queue.push_back({task_id});
-    retry_enqueues++;
     tasks_seen++;
+
+    if(!TryPlaceTask(task_id)) {
+        EnqueueRetry(task_id);
+    }
 }
 
 void Scheduler::PeriodicCheck(Time_t now) {
@@ -243,7 +299,7 @@ void Scheduler::PeriodicCheck(Time_t now) {
     // SchedulerCheck is called periodically by the simulator to allow you to monitor, make decisions, adjustments, etc.
     // Unlike the other invocations of the scheduler, this one doesn't report any specific event
     // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
-    (void)now;
+    ProcessRetryQueue(now);
 }
 
 void Scheduler::Shutdown(Time_t time) {
