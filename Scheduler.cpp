@@ -1,10 +1,3 @@
-//
-//  Scheduler.cpp
-//  CloudSim
-//
-//  Created by ELMOOTAZBELLAH ELNOZAHY on 10/20/24.
-//
-
 #include "Scheduler.hpp"
 
 #include <algorithm>
@@ -22,9 +15,8 @@ constexpr unsigned kMinReadyGpuMachinesPerCpu = 4;
 constexpr Time_t kProtectionWindow = 5'000'000;
 constexpr Time_t kIdleSleepDelay = 2'000'000;
 constexpr Time_t kPreferredIdleSleepDelay = 10'000'000;
-constexpr Time_t kEnergyDebugInterval = 5'000'000;
+constexpr Time_t kColdShutdownDelay = 20'000'000;
 constexpr bool kEnableIdleSleep = true;
-constexpr bool kEnableUnderloadEvacuation = false;
 constexpr unsigned kPreferredTierReserveDivisor = 4;
 
 uint64_t MachineCapacityScore(MachineId_t machine_id) {
@@ -181,42 +173,6 @@ bool IsPreferredMachineForCpu(const unordered_map<CPUType_t, uint64_t> & best_ca
     unsigned base_mips = machine_info.performance.empty() ? 0 : machine_info.performance[0];
     uint64_t machine_score = static_cast<uint64_t>(machine_info.num_cpus) * base_mips;
     return machine_score * 100 >= best_score * 75;
-}
-
-const char * CpuTypeName(CPUType_t cpu_type) {
-    switch(cpu_type) {
-        case X86:
-            return "X86";
-        case ARM:
-            return "ARM";
-        case POWER:
-            return "POWER";
-        case RISCV:
-            return "RISCV";
-        default:
-            return "UNKNOWN";
-    }
-}
-
-const char * MachineStateName(MachineState_t state) {
-    switch(state) {
-        case S0:
-            return "S0";
-        case S0i1:
-            return "S0i1";
-        case S1:
-            return "S1";
-        case S2:
-            return "S2";
-        case S3:
-            return "S3";
-        case S4:
-            return "S4";
-        case S5:
-            return "S5";
-        default:
-            return "UNKNOWN";
-    }
 }
 
 }  // namespace
@@ -509,6 +465,7 @@ bool Scheduler::TryWakeMachineForTask(TaskId_t task_id) {
     }
 
     idle_since.erase(best_machine);
+    low_power_since.erase(best_machine);
     pending_state_changes.insert(best_machine);
     Machine_SetState(best_machine, S0);
     SimOutput("Scheduler::TryWakeMachineForTask(): waking machine " +
@@ -599,8 +556,39 @@ void Scheduler::MaybeSleepMachine(MachineId_t machine_id, Time_t now) {
 
     MachineInfo_t machine_info = Machine_GetInfo(machine_id);
     bool is_preferred = IsPreferredMachineForCpu(best_capacity_by_cpu, machine_info);
-    if(machine_info.s_state != S0 || machine_info.active_tasks != 0 || machine_info.active_vms != 0) {
+    if(machine_info.active_tasks != 0 || machine_info.active_vms != 0) {
         idle_since.erase(machine_id);
+        low_power_since.erase(machine_id);
+        return;
+    }
+
+    if(machine_info.s_state == S0i1) {
+        idle_since.erase(machine_id);
+        if(is_preferred || machine_info.gpus) {
+            return;
+        }
+
+        auto low_power_it = low_power_since.find(machine_id);
+        if(low_power_it == low_power_since.end()) {
+            low_power_since[machine_id] = now;
+            return;
+        }
+        if(now - low_power_it->second < kColdShutdownDelay) {
+            return;
+        }
+
+        low_power_since.erase(machine_id);
+        pending_state_changes.insert(machine_id);
+        Machine_SetState(machine_id, S5);
+        SimOutput("Scheduler::MaybeSleepMachine(): moving cold idle machine " +
+                  to_string(machine_id) + " from S0i1 to S5 at time " +
+                  to_string(now), 1);
+        return;
+    }
+
+    if(machine_info.s_state != S0) {
+        idle_since.erase(machine_id);
+        low_power_since.erase(machine_id);
         return;
     }
 
@@ -628,6 +616,7 @@ void Scheduler::MaybeSleepMachine(MachineId_t machine_id, Time_t now) {
     }
 
     idle_since.erase(machine_id);
+    low_power_since[machine_id] = now;
     pending_state_changes.insert(machine_id);
     Machine_SetState(machine_id, S0i1);
     SimOutput("Scheduler::MaybeSleepMachine(): moving idle machine " +
@@ -780,228 +769,14 @@ void Scheduler::MaybeRelieveOverload(Time_t now) {
     TryRelieveMachineOverload(best_source, now);
 }
 
-void Scheduler::MaybeEvacuateUnderload(Time_t now) {
-    if(!kEnableUnderloadEvacuation) {
-        return;
-    }
-    if(!migrating_vms.empty()) {
-        return;
-    }
-
-    auto source_is_still_valid = [&](MachineId_t machine_id) {
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        return host_states[machine_id] == HostState::UNDERLOADED &&
-               machine_info.active_vms > 0 &&
-               machine_info.s_state == S0 &&
-               !IsMachineProtected(machine_id, now);
-    };
-
-    if(evacuating_machine.has_value() && !source_is_still_valid(*evacuating_machine)) {
-        evacuating_machine.reset();
-    }
-
-    if(!evacuating_machine.has_value()) {
-        MachineId_t best_source = numeric_limits<MachineId_t>::max();
-        double best_source_load = numeric_limits<double>::max();
-        for(MachineId_t machine_id : machines) {
-            if(!source_is_still_valid(machine_id)) {
-                continue;
-            }
-
-            double source_load = MachineLoadScore(machine_id);
-            if(source_load < best_source_load) {
-                best_source_load = source_load;
-                best_source = machine_id;
-            }
-        }
-
-        if(best_source == numeric_limits<MachineId_t>::max()) {
-            return;
-        }
-        evacuating_machine = best_source;
-    }
-
-    MachineId_t source = *evacuating_machine;
-    vector<VMId_t> source_vms;
-    for(VMId_t vm_id : vms) {
-        if(migrating_vms.count(vm_id) != 0) {
-            continue;
-        }
-        VMInfo_t vm_info = VM_GetInfo(vm_id);
-        if(vm_info.machine_id == source && !vm_info.active_tasks.empty()) {
-            source_vms.push_back(vm_id);
-        }
-    }
-
-    if(source_vms.empty()) {
-        evacuating_machine.reset();
-        return;
-    }
-
-    sort(source_vms.begin(), source_vms.end(), [](VMId_t lhs, VMId_t rhs) {
-        return EstimatedVmMemory(lhs) > EstimatedVmMemory(rhs);
-    });
-
-    unordered_map<MachineId_t, unsigned> simulated_tasks;
-    unordered_map<MachineId_t, unsigned> simulated_memory;
-    auto simulated_sla_counts = machine_sla_vm_counts;
-    for(MachineId_t machine_id : machines) {
-        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-        simulated_tasks[machine_id] = machine_info.active_tasks;
-        simulated_memory[machine_id] = machine_info.memory_used;
-    }
-
-    vector<pair<VMId_t, MachineId_t>> migration_plan;
-
-    for(VMId_t vm_id : source_vms) {
-        VMInfo_t vm_info = VM_GetInfo(vm_id);
-        SLAType_t vm_sla = vm_slas[vm_id];
-        unsigned vm_memory = EstimatedVmMemory(vm_id);
-        unsigned vm_task_count = static_cast<unsigned>(vm_info.active_tasks.size());
-
-        MachineId_t best_destination = numeric_limits<MachineId_t>::max();
-        int best_bucket = numeric_limits<int>::max();
-        double best_destination_load = numeric_limits<double>::max();
-
-        for(MachineId_t machine_id : machines) {
-            if(machine_id == source ||
-               pending_state_changes.count(machine_id) != 0 ||
-               IsMachineProtected(machine_id, now)) {
-                continue;
-            }
-
-            MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-            if(machine_info.cpu != vm_info.cpu ||
-               machine_info.s_state != S0 ||
-               host_states[machine_id] == HostState::OVERLOADED) {
-                continue;
-            }
-
-            if(simulated_memory[machine_id] + vm_memory > machine_info.memory_size) {
-                continue;
-            }
-
-            double projected_task_pressure = static_cast<double>(simulated_tasks[machine_id] + vm_task_count) /
-                                             std::max(1u, machine_info.num_cpus);
-            double projected_memory_pressure = static_cast<double>(simulated_memory[machine_id] + vm_memory) /
-                                               std::max(1u, machine_info.memory_size);
-            double projected_load = std::max(projected_task_pressure, projected_memory_pressure);
-            if(projected_load >= kOverloadThreshold) {
-                continue;
-            }
-
-            TaskId_t representative_task = vm_info.active_tasks.front();
-            SLAType_t representative_sla = RequiredSLA(representative_task);
-            bool machine_is_preferred = true;
-            auto best_it = best_capacity_by_cpu.find(vm_info.cpu);
-            uint64_t best_score = (best_it == best_capacity_by_cpu.end()) ? 0 : best_it->second;
-            if((representative_sla == SLA0 || representative_sla == SLA1) && best_score != 0) {
-                unsigned base_mips = machine_info.performance.empty() ? 0 : machine_info.performance[0];
-                uint64_t machine_score = static_cast<uint64_t>(machine_info.num_cpus) * base_mips;
-                machine_is_preferred = machine_score * 100 >= best_score * 75;
-            }
-
-            unsigned preferred_machines = 0;
-            unsigned preferred_sla0_machines = 0;
-            for(MachineId_t candidate : machines) {
-                MachineInfo_t candidate_info = Machine_GetInfo(candidate);
-                if(candidate_info.cpu != vm_info.cpu) {
-                    continue;
-                }
-                unsigned candidate_mips = candidate_info.performance.empty() ? 0 : candidate_info.performance[0];
-                uint64_t candidate_score = static_cast<uint64_t>(candidate_info.num_cpus) * candidate_mips;
-                bool candidate_is_preferred = best_score == 0 || candidate_score * 100 >= best_score * 75;
-                if(!candidate_is_preferred) {
-                    continue;
-                }
-                preferred_machines++;
-                auto counts_it = simulated_sla_counts.find(candidate);
-                if(counts_it != simulated_sla_counts.end() && counts_it->second[SLA0] > 0) {
-                    preferred_sla0_machines++;
-                }
-            }
-
-            auto counts_it = simulated_sla_counts.find(machine_id);
-            bool machine_already_hosts_sla0 = counts_it != simulated_sla_counts.end() &&
-                                              counts_it->second[SLA0] > 0;
-            int bucket = PlacementBucket(machine_is_preferred,
-                                         ShouldReservePreferredCapacityForSla1(representative_sla,
-                                                                              machine_is_preferred,
-                                                                              machine_already_hosts_sla0,
-                                                                              preferred_machines,
-                                                                              preferred_sla0_machines),
-                                         ShouldAvoidMixedSlaMachine(simulated_sla_counts,
-                                                                    representative_task,
-                                                                    machine_id),
-                                         false,
-                                         false);
-
-            if(bucket < best_bucket ||
-               (bucket == best_bucket && projected_load < best_destination_load)) {
-                best_bucket = bucket;
-                best_destination_load = projected_load;
-                best_destination = machine_id;
-            }
-        }
-
-        if(best_destination == numeric_limits<MachineId_t>::max()) {
-            evacuating_machine.reset();
-            return;
-        }
-
-        migration_plan.push_back({vm_id, best_destination});
-        simulated_tasks[source] = simulated_tasks[source] > vm_task_count ?
-                                  simulated_tasks[source] - vm_task_count : 0;
-        simulated_memory[source] = simulated_memory[source] > vm_memory ?
-                                   simulated_memory[source] - vm_memory : 0;
-        if(simulated_sla_counts[source][vm_sla] > 0) {
-            simulated_sla_counts[source][vm_sla]--;
-        }
-        simulated_tasks[best_destination] += vm_task_count;
-        simulated_memory[best_destination] += vm_memory;
-        simulated_sla_counts[best_destination][vm_sla]++;
-    }
-
-    if(migration_plan.empty()) {
-        evacuating_machine.reset();
-        return;
-    }
-
-    VMId_t vm_id = migration_plan.front().first;
-    MachineId_t destination = migration_plan.front().second;
-    migrating_vms.insert(vm_id);
-    migration_sources[vm_id] = source;
-    migration_destinations[vm_id] = destination;
-    VM_Migrate(vm_id, destination);
-    SimOutput("Scheduler::MaybeEvacuateUnderload(): evacuating machine " + to_string(source) +
-              " by migrating VM " + to_string(vm_id) +
-              " to machine " + to_string(destination) +
-              " remaining_vms=" + to_string(source_vms.size()), 1);
-}
-
 void Scheduler::Init() {
-    // Find the parameters of the clusters
-    // Get the total number of machines
-    // For each machine:
-    //      Get the type of the machine
-    //      Get the memory of the machine
-    //      Get the number of CPUs
-    //      Get if there is a GPU or not
-    // 
     unsigned total_machines = Machine_GetTotal();
     total_tasks = GetNumTasks();
     completed_tasks = 0;
     next_progress_percent = 10;
-    max_target_completion = 0;
-    next_time_progress_percent = 10;
-    next_energy_debug_time = kEnergyDebugInterval;
     SimOutput("Scheduler::Init(): Total number of machines is " + to_string(total_machines), 3);
     SimOutput("Scheduler::Init(): Total number of tasks is " + to_string(total_tasks), 2);
     SimOutput("Scheduler::Init(): Initializing scheduler", 1);
-    for(unsigned i = 0; i < total_tasks; i++) {
-        TaskInfo_t task_info = GetTaskInfo(TaskId_t(i));
-        max_target_completion = max(max_target_completion, task_info.target_completion);
-    }
     for(unsigned i = 0; i < total_machines; i++) {
         machines.push_back(MachineId_t(i));
         MachineInfo_t info = Machine_GetInfo(MachineId_t(i));
@@ -1033,6 +808,7 @@ void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
         }
         machine_sla_vm_counts[destination_it->second][vm_sla]++;
         idle_since.erase(destination_it->second);
+        low_power_since.erase(destination_it->second);
     }
 
     migrating_vms.erase(vm_id);
@@ -1057,28 +833,10 @@ void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
 
     RefreshMachineStates();
     MaybeRelieveOverload(time);
-    MaybeEvacuateUnderload(time);
     RetryWaitingTasks(time);
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
-    // Get the task parameters
-    //  IsGPUCapable(task_id);
-    //  GetMemory(task_id);
-    //  RequiredVMType(task_id);
-    //  RequiredSLA(task_id);
-    //  RequiredCPUType(task_id);
-    // Decide to attach the task to an existing VM, 
-    //      vm.AddTask(taskid, Priority_T priority); or
-    // Create a new VM, attach the VM to a machine
-    //      VM vm(type of the VM)
-    //      vm.Attach(machine_id);
-    //      vm.AddTask(taskid, Priority_t priority) or
-    // Turn on a machine, create a new VM, attach it to the VM, then add the task
-    //
-    // Turn on a machine, migrate an existing VM from a loaded machine....
-    //
-    // Other possibilities as desired
     if(!TryPlaceTask(task_id, true)) {
         TryWakeMachineForTask(task_id);
         waiting_tasks.push_back(task_id);
@@ -1089,46 +847,21 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
 }
 
 void Scheduler::PeriodicCheck(Time_t now) {
-    // This method should be called from SchedulerCheck()
-    // SchedulerCheck is called periodically by the simulator to allow you to monitor, make decisions, adjustments, etc.
-    // Unlike the other invocations of the scheduler, this one doesn't report any specific event
-    // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
     RefreshMachineStates();
     MaybeRelieveOverload(now);
-    MaybeEvacuateUnderload(now);
     for(MachineId_t machine_id : machines) {
         MaybeSleepMachine(machine_id, now);
     }
     RetryWaitingTasks(now);
-    if(max_target_completion > 0) {
-        unsigned time_progress_percent = static_cast<unsigned>((now * 100) / max_target_completion);
-        while(next_time_progress_percent <= 100 &&
-              time_progress_percent >= next_time_progress_percent) {
-            SimOutput("Scheduler::TimeProgress(): " + to_string(next_time_progress_percent) +
-                      "% of simulated timeline (" + to_string(now) + "/" +
-                      to_string(max_target_completion) + " us)", 0);
-            next_time_progress_percent += 10;
-        }
-    }
-    MaybePrintEnergyDebugSummary(now);
 }
 
 void Scheduler::Shutdown(Time_t time) {
-    // Do your final reporting and bookkeeping here.
-    // Report about the total energy consumed
-    // Report about the SLA compliance
-    // Shutdown everything to be tidy :-)
     for(auto & vm: vms) {
         VM_Shutdown(vm);
     }
-    SimOutput("SimulationComplete(): Finished!", 4);
-    SimOutput("SimulationComplete(): Time is " + to_string(time), 4);
 }
 
 void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
-    // Do any bookkeeping necessary for the data structures
-    // Decide if a machine is to be turned off, slowed down, or VMs to be migrated according to your policy
-    // This is an opportunity to make any adjustments to optimize performance/energy
     if(completed_tasks < total_tasks) {
         completed_tasks++;
     }
@@ -1163,8 +896,6 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
                           " is empty but still migrating, deferring shutdown", 2);
                 return;
             }
-            // Multiple task completions can arrive back-to-back for the same VM.
-            // Once the VM is empty, clear every remaining stale task->VM mapping first.
             for(auto it = task_to_vm.begin(); it != task_to_vm.end(); ) {
                 if(it->second == vm_id) {
                     it = task_to_vm.erase(it);
@@ -1187,115 +918,19 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     }
 
     RetryWaitingTasks(now);
-    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " is complete at " + to_string(now), 4);
 }
 
 void Scheduler::StateChangeFinished(Time_t time, MachineId_t machine_id) {
     pending_state_changes.erase(machine_id);
+    MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+    if(machine_info.s_state == S0) {
+        low_power_since.erase(machine_id);
+    } else if(machine_info.s_state == S0i1 || machine_info.s_state == S5) {
+        low_power_since[machine_id] = time;
+    }
     SimOutput("Scheduler::StateChangeFinished(): machine " + to_string(machine_id) +
               " completed state change at time " + to_string(time), 2);
     RetryWaitingTasks(time);
-}
-
-void Scheduler::MaybePrintEnergyDebugSummary(Time_t now) {
-    if(now < next_energy_debug_time) {
-        return;
-    }
-    next_energy_debug_time = now + kEnergyDebugInterval;
-
-    unsigned s0_count = 0;
-    unsigned s0i1_count = 0;
-    unsigned deeper_sleep_count = 0;
-    unsigned active_machine_count = 0;
-    unsigned empty_s0_preferred = 0;
-    unsigned empty_s0_nonpreferred = 0;
-    unsigned overloaded_count = 0;
-    unsigned normal_count = 0;
-    unsigned underloaded_count = 0;
-
-    struct HotMachine {
-        double load = -1.0;
-        MachineId_t machine_id = 0;
-        MachineInfo_t info{};
-    };
-    vector<HotMachine> hottest;
-
-    for(MachineId_t machine_id : machines) {
-        MachineInfo_t info = Machine_GetInfo(machine_id);
-        double load = MachineLoadScore(machine_id);
-
-        if(info.s_state == S0) {
-            s0_count++;
-        } else if(info.s_state == S0i1) {
-            s0i1_count++;
-        } else {
-            deeper_sleep_count++;
-        }
-
-        if(info.active_tasks > 0) {
-            active_machine_count++;
-        }
-
-        if(info.s_state == S0 && info.active_tasks == 0 && info.active_vms == 0) {
-            if(IsPreferredMachineForCpu(best_capacity_by_cpu, info)) {
-                empty_s0_preferred++;
-            } else {
-                empty_s0_nonpreferred++;
-            }
-        }
-
-        auto host_it = host_states.find(machine_id);
-        if(host_it != host_states.end()) {
-            switch(host_it->second) {
-                case HostState::OVERLOADED:
-                    overloaded_count++;
-                    break;
-                case HostState::NORMAL:
-                    normal_count++;
-                    break;
-                case HostState::UNDERLOADED:
-                    underloaded_count++;
-                    break;
-            }
-        }
-
-        hottest.push_back({load, machine_id, info});
-    }
-
-    sort(hottest.begin(), hottest.end(), [](const HotMachine & lhs, const HotMachine & rhs) {
-        return lhs.load > rhs.load;
-    });
-
-    SimOutput("Scheduler::EnergyDebug(): time=" + to_string(now) +
-              " energy=" + to_string(Machine_GetClusterEnergy()) +
-              " waiting=" + to_string(waiting_tasks.size()) +
-              " migrating=" + to_string(migrating_vms.size()) +
-              " pending_state_changes=" + to_string(pending_state_changes.size()) +
-              " S0=" + to_string(s0_count) +
-              " S0i1=" + to_string(s0i1_count) +
-              " deeper_sleep=" + to_string(deeper_sleep_count) +
-              " active_machines=" + to_string(active_machine_count) +
-              " overloaded=" + to_string(overloaded_count) +
-              " normal=" + to_string(normal_count) +
-              " underloaded=" + to_string(underloaded_count), 1);
-
-    SimOutput("Scheduler::EnergyDebugIdle(): empty_S0_preferred=" + to_string(empty_s0_preferred) +
-              " empty_S0_nonpreferred=" + to_string(empty_s0_nonpreferred) +
-              " idle_tracking=" + to_string(idle_since.size()), 1);
-
-    string hot_line = "Scheduler::EnergyDebugHot():";
-    unsigned hot_limit = min<unsigned>(3, hottest.size());
-    for(unsigned i = 0; i < hot_limit; i++) {
-        const HotMachine & hot = hottest[i];
-        hot_line += " m=" + to_string(hot.machine_id) +
-                    "(" + CpuTypeName(hot.info.cpu) + "," + MachineStateName(hot.info.s_state) + ")" +
-                    " load=" + to_string(hot.load) +
-                    " tasks=" + to_string(hot.info.active_tasks) +
-                    " vms=" + to_string(hot.info.active_vms) +
-                    " mem=" + to_string(hot.info.memory_used) + "/" +
-                    to_string(hot.info.memory_size);
-    }
-    SimOutput(hot_line, 1);
 }
 
 void Scheduler::HandleSLAWarning(Time_t time, TaskId_t task_id) {
@@ -1333,52 +968,39 @@ void Scheduler::HandleMemoryWarning(Time_t time, MachineId_t machine_id) {
     RetryWaitingTasks(time);
 }
 
-// Public interface below
-
 static Scheduler Scheduler;
 
 void InitScheduler() {
-    SimOutput("InitScheduler(): Initializing scheduler", 4);
     Scheduler.Init();
 }
 
 void HandleNewTask(Time_t time, TaskId_t task_id) {
-    SimOutput("HandleNewTask(): Received new task " + to_string(task_id) + " at time " + to_string(time), 4);
     Scheduler.NewTask(time, task_id);
 }
 
 void HandleTaskCompletion(Time_t time, TaskId_t task_id) {
-    SimOutput("HandleTaskCompletion(): Task " + to_string(task_id) + " completed at time " + to_string(time), 4);
     Scheduler.TaskComplete(time, task_id);
 }
 
 void MemoryWarning(Time_t time, MachineId_t machine_id) {
-    // The simulator is alerting you that machine identified by machine_id is overcommitted
     Scheduler.HandleMemoryWarning(time, machine_id);
 }
 
 void MigrationDone(Time_t time, VMId_t vm_id) {
-    // The function is called on to alert you that migration is complete
-    SimOutput("MigrationDone(): Migration of VM " + to_string(vm_id) + " was completed at time " + to_string(time), 4);
     Scheduler.MigrationComplete(time, vm_id);
 }
 
 void SchedulerCheck(Time_t time) {
-    // This function is called periodically by the simulator, no specific event
-    SimOutput("SchedulerCheck(): SchedulerCheck() called at " + to_string(time), 4);
     Scheduler.PeriodicCheck(time);
 }
 
 void SimulationComplete(Time_t time) {
-    // This function is called before the simulation terminates Add whatever you feel like.
     cout << "SLA violation report" << endl;
     cout << "SLA0: " << GetSLAReport(SLA0) << "%" << endl;
     cout << "SLA1: " << GetSLAReport(SLA1) << "%" << endl;
-    cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;     // SLA3 do not have SLA violation issues
+    cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;
     cout << "Total Energy " << Machine_GetClusterEnergy() << "KW-Hour" << endl;
     cout << "Simulation run finished in " << double(time)/1000000 << " seconds" << endl;
-    SimOutput("SimulationComplete(): Simulation finished at time " + to_string(time), 4);
-    
     Scheduler.Shutdown(time);
 }
 
@@ -1387,6 +1009,5 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
 }
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
-    // Called in response to an earlier request to change the state of a machine
     Scheduler.StateChangeFinished(time, machine_id);
 }

@@ -1,10 +1,3 @@
-//
-//  Scheduler.hpp
-//  CloudSim
-//
-//  Created by ELMOOTAZBELLAH ELNOZAHY on 10/20/24.
-//
-
 #ifndef Scheduler_hpp
 #define Scheduler_hpp
 
@@ -45,9 +38,7 @@ private:
     void MaybeSleepMachine(MachineId_t machine_id, Time_t now);
     bool TryRelieveMachineOverload(MachineId_t machine_id, Time_t now);
     void MaybeRelieveOverload(Time_t now);
-    void MaybeEvacuateUnderload(Time_t now);
     void RetryWaitingTasks(Time_t now);
-    void MaybePrintEnergyDebugSummary(Time_t now);
     unsigned CountReadyMachines(CPUType_t cpu_type, MachineId_t exclude_machine) const;
     unsigned CountReadyPreferredMachines(CPUType_t cpu_type, MachineId_t exclude_machine) const;
     unsigned CountReadyGpuMachines(CPUType_t cpu_type, MachineId_t exclude_machine) const;
@@ -59,7 +50,6 @@ private:
     unordered_map<VMId_t, SLAType_t> vm_slas;
     unordered_map<CPUType_t, uint64_t> best_capacity_by_cpu;
     unordered_map<MachineId_t, array<unsigned, NUM_SLAS>> machine_sla_vm_counts;
-    optional<MachineId_t> evacuating_machine;
     unordered_set<VMId_t> migrating_vms;
     unordered_map<VMId_t, MachineId_t> migration_sources;
     unordered_map<VMId_t, MachineId_t> migration_destinations;
@@ -67,12 +57,10 @@ private:
     unordered_map<MachineId_t, HostState> host_states;
     unordered_map<MachineId_t, Time_t> protected_until;
     unordered_map<MachineId_t, Time_t> idle_since;
+    unordered_map<MachineId_t, Time_t> low_power_since;
     unsigned total_tasks = 0;
     unsigned completed_tasks = 0;
     unsigned next_progress_percent = 10;
-    Time_t max_target_completion = 0;
-    unsigned next_time_progress_percent = 10;
-    Time_t next_energy_debug_time = 0;
 };
 
 
