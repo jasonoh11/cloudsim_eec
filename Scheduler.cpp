@@ -186,14 +186,9 @@ void Scheduler::ProcessRetryQueue(Time_t now) {
         }
 
         task_it->second.retry_count++;
-        if(task_it->second.retry_count >= kMaxRetriesPerTask) {
-            task_it->second.placement_failed = true;
-            placement_failures++;
-            failed_task_ids.push_back(entry.task_id);
-            SimOutput("Scheduler::ProcessRetryQueue(): task " + to_string(entry.task_id) + " failed placement at time " + to_string(now), 1);
-            continue;
+        if(task_it->second.retry_count == kMaxRetriesPerTask) {
+            SimOutput("Scheduler::ProcessRetryQueue(): task " + to_string(entry.task_id) + " reached retry threshold at time " + to_string(now) + ", continuing retries", 2);
         }
-
         retry_queue.push_back(entry);
     }
 }
@@ -309,6 +304,29 @@ void Scheduler::Shutdown(Time_t time) {
     // Report about the total energy consumed
     // Report about the SLA compliance
     // Shutdown everything to be tidy :-)
+    cout << "Scheduler report" << endl;
+    cout << "Tasks seen: " << tasks_seen << endl;
+    cout << "Tasks completed: " << tasks_completed << endl;
+    cout << "Successful placements: " << successful_placements << endl;
+    cout << "Retry enqueues: " << retry_enqueues << endl;
+    cout << "Retry attempts: " << retry_attempts << endl;
+    cout << "Placement failures: " << placement_failures << endl;
+    cout << "VMs created: " << vms_created << endl;
+    cout << "Migrations: " << migrations << endl;
+    cout << "Wakeups: " << wakeups << endl;
+    cout << "Failed task IDs: ";
+    if(failed_task_ids.empty()) {
+        cout << "none";
+    } else {
+        for(size_t i = 0; i < failed_task_ids.size(); i++) {
+            if(i > 0) {
+                cout << ",";
+            }
+            cout << failed_task_ids[i];
+        }
+    }
+    cout << endl;
+
     for(auto & vm_entry: vm_states) {
         VM_Shutdown(vm_entry.first);
     }
