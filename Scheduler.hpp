@@ -23,6 +23,7 @@ public:
     void MigrationComplete(Time_t time, VMId_t vm_id);
     void NewTask(Time_t now, TaskId_t task_id);
     void PeriodicCheck(Time_t now);
+    void SLAWarn(Time_t now, TaskId_t task_id);
     void Shutdown(Time_t now);
     void TaskComplete(Time_t now, TaskId_t task_id);
 
@@ -70,6 +71,8 @@ private:
 
     static constexpr double kCapacityCap = 0.80;
     static constexpr unsigned kMaxRetriesPerTask = 3;
+    static constexpr unsigned kMaxMigrationsPerTick = 2;
+    static constexpr Time_t kMigrationCooldown = 2000000;
 
     void InitializeMachineViews();
     void RefreshMachineStatesFromSimulator();
@@ -77,6 +80,11 @@ private:
     unsigned AdditionalPlacementMemory(TaskId_t task_id, bool creating_vm) const;
     bool IsMachineFeasible(TaskId_t task_id, MachineId_t machine_id, bool creating_vm) const;
     bool HasReusableVM(MachineId_t machine_id, VMType_t required_vm, CPUType_t required_cpu, VMId_t &vm_id) const;
+    bool IsTaskAtRisk(TaskId_t task_id, Time_t now) const;
+    void RefreshProtectedMachines(Time_t now);
+    bool FindBestMigrationTarget(VMId_t vm_id, MachineId_t &target_machine_id) const;
+    bool TryMigrateAtRiskTask(TaskId_t task_id, Time_t now, bool allow_wake);
+    void ProcessAtRiskMigrations(Time_t now);
     bool TryPlaceTask(TaskId_t task_id);
     void EnqueueRetry(TaskId_t task_id);
     void ProcessRetryQueue(Time_t now);
@@ -87,6 +95,8 @@ private:
     unordered_map<VMId_t, VMState> vm_states;
     unordered_map<TaskId_t, TaskState> task_states;
     unordered_map<TaskId_t, VMId_t> task_to_vm;
+    unordered_map<VMId_t, Time_t> vm_last_migration_time;
+    unordered_set<MachineId_t> protected_machines;
 
     deque<RetryEntry> retry_queue;
 
@@ -100,6 +110,8 @@ private:
     unsigned vms_created = 0;
     unsigned migrations = 0;
     unsigned wakeups = 0;
+    unsigned at_risk_tasks_detected = 0;
+    unsigned protected_machine_skips = 0;
     vector<TaskId_t> failed_task_ids;
 };
 

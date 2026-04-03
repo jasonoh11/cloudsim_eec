@@ -7,6 +7,8 @@
 
 #include "Scheduler.hpp"
 
+#include <limits>
+
 void Scheduler::InitializeMachineViews() {
     machines.clear();
     machine_views.clear();
@@ -47,10 +49,11 @@ void Scheduler::RefreshMachineStatesFromSimulator() {
 Priority_t Scheduler::PriorityFromSLA(SLAType_t sla) const {
     switch(sla) {
         case SLA0:
-        case SLA1:
             return HIGH_PRIORITY;
-        case SLA2:
+        case SLA1:
             return MID_PRIORITY;
+        case SLA2:
+            return LOW_PRIORITY;
         case SLA3:
         default:
             return LOW_PRIORITY;
@@ -113,6 +116,202 @@ bool Scheduler::HasReusableVM(MachineId_t machine_id, VMType_t required_vm, CPUT
     return false;
 }
 
+/*
+* Mark task as at risk if only has 20% or less of its window before SLA violation.
+*/
+bool Scheduler::IsTaskAtRisk(TaskId_t task_id, Time_t now) const {
+    const auto task_it = task_states.find(task_id);
+    if(task_it == task_states.end()) {
+        return false;
+    }
+
+    const TaskState &state = task_it->second;
+    if(state.completed || !state.assigned || state.required_sla == SLA3) {
+        return false;
+    }
+
+    const TaskInfo_t info = GetTaskInfo(task_id);
+    if(info.completed || info.target_completion <= info.arrival) {
+        return false;
+    }
+
+    if(now >= info.target_completion) {
+        return true;
+    }
+
+    const uint64_t window = info.target_completion - info.arrival;
+    const uint64_t remaining = info.target_completion - now;
+    return (remaining * 100ULL) <= (window * 20ULL);
+}
+
+void Scheduler::RefreshProtectedMachines(Time_t now) {
+    protected_machines.clear();
+
+    for(const auto &kv : task_states) {
+        const TaskId_t task_id = kv.first;
+        const TaskState &state = kv.second;
+        if(!state.assigned || state.completed) {
+            continue;
+        }
+
+        if(!IsTaskAtRisk(task_id, now)) {
+            continue;
+        }
+
+        const auto vm_it = vm_states.find(state.assigned_vm);
+        if(vm_it == vm_states.end()) {
+            continue;
+        }
+
+        protected_machines.insert(vm_it->second.machine_id);
+        at_risk_tasks_detected++;
+    }
+}
+
+bool Scheduler::FindBestMigrationTarget(VMId_t vm_id, MachineId_t &target_machine_id) const {
+    const auto vm_it = vm_states.find(vm_id);
+    if(vm_it == vm_states.end()) {
+        return false;
+    }
+
+    const VMState &vm_state = vm_it->second;
+    const auto source_machine_it = machine_views.find(vm_state.machine_id);
+    if(source_machine_it == machine_views.end()) {
+        return false;
+    }
+
+    const unsigned migration_footprint = vm_state.tracked_memory_footprint;
+    if(migration_footprint == 0) {
+        return false;
+    }
+
+    double best_utilization = std::numeric_limits<double>::max();
+    bool found = false;
+    MachineId_t best_machine = vm_state.machine_id;
+
+    for(const auto machine_id : machines) {
+        if(machine_id == vm_state.machine_id) {
+            continue;
+        }
+
+        const auto machine_it = machine_views.find(machine_id);
+        if(machine_it == machine_views.end()) {
+            continue;
+        }
+
+        const MachineStateView &machine = machine_it->second;
+        if(machine.s_state != S0 || machine.cpu != vm_state.cpu || machine.memory_capacity == 0) {
+            continue;
+        }
+
+        const unsigned projected_used = machine.tracked_memory_used + migration_footprint;
+        const double projected_utilization = static_cast<double>(projected_used) / static_cast<double>(machine.memory_capacity);
+        if(projected_utilization >= kCapacityCap) {
+            continue;
+        }
+
+        // Prefer targets that are not currently protected to avoid shifting pressure onto hot hosts.
+        const bool target_protected = (protected_machines.find(machine_id) != protected_machines.end());
+        const bool best_protected = found ? (protected_machines.find(best_machine) != protected_machines.end()) : true;
+        if(found && target_protected != best_protected) {
+            if(target_protected) {
+                continue;
+            }
+        }
+
+        if(!found || projected_utilization < best_utilization || (projected_utilization == best_utilization && machine_id < best_machine)) {
+            found = true;
+            best_utilization = projected_utilization;
+            best_machine = machine_id;
+        }
+    }
+
+    if(!found) {
+        return false;
+    }
+
+    target_machine_id = best_machine;
+    return true;
+}
+
+bool Scheduler::TryMigrateAtRiskTask(TaskId_t task_id, Time_t now, bool allow_wake) {
+    auto task_it = task_states.find(task_id);
+    if(task_it == task_states.end()) {
+        return false;
+    }
+
+    TaskState &task = task_it->second;
+    if(task.completed || !task.assigned || task.required_sla != SLA0) {
+        return false;
+    }
+
+    if(!IsTaskAtRisk(task_id, now)) {
+        return false;
+    }
+
+    auto vm_it = vm_states.find(task.assigned_vm);
+    if(vm_it == vm_states.end()) {
+        return false;
+    }
+
+    VMState &vm_state = vm_it->second;
+    if(vm_state.migrating) {
+        return false;
+    }
+
+    const auto cooldown_it = vm_last_migration_time.find(vm_state.vm_id);
+    if(cooldown_it != vm_last_migration_time.end() && now < cooldown_it->second + kMigrationCooldown) {
+        return false;
+    }
+
+    MachineId_t target_machine_id = vm_state.machine_id;
+    if(FindBestMigrationTarget(vm_state.vm_id, target_machine_id)) {
+        VM_Migrate(vm_state.vm_id, target_machine_id);
+        vm_state.migrating = true;
+        vm_last_migration_time[vm_state.vm_id] = now;
+        migrations++;
+        return true;
+    }
+
+    if(!allow_wake) {
+        return false;
+    }
+
+    // If no active target exists, wake a compatible standby machine to absorb imminent SLA pressure.
+    for(const auto machine_id : machines) {
+        auto machine_it = machine_views.find(machine_id);
+        if(machine_it == machine_views.end()) {
+            continue;
+        }
+
+        MachineStateView &machine = machine_it->second;
+        if(machine.cpu != vm_state.cpu || machine.s_state == S0) {
+            continue;
+        }
+
+        Machine_SetState(machine_id, S0);
+        machine.state_change_pending = true;
+        wakeups++;
+        return true;
+    }
+
+    return false;
+}
+
+void Scheduler::ProcessAtRiskMigrations(Time_t now) {
+    unsigned migrations_this_tick = 0;
+    for(const auto &kv : task_states) {
+        if(migrations_this_tick >= kMaxMigrationsPerTick) {
+            break;
+        }
+
+        const TaskId_t task_id = kv.first;
+        if(TryMigrateAtRiskTask(task_id, now, true)) {
+            migrations_this_tick++;
+        }
+    }
+}
+
 bool Scheduler::TryPlaceTask(TaskId_t task_id) {
     const auto task_it = task_states.find(task_id);
     if(task_it == task_states.end()) {
@@ -127,7 +326,18 @@ bool Scheduler::TryPlaceTask(TaskId_t task_id) {
     const VMType_t required_vm = task_it->second.required_vm;
     const Priority_t priority = task_it->second.assigned_priority;
 
-    for(const auto machine_id : machines) {
+    // More frequent refresh keeps placement decisions aligned with simulator-side changes.
+    RefreshMachineStatesFromSimulator();
+
+    bool skipped_any_protected_machine = false;
+    auto try_pass = [&](bool allow_protected_hosts) -> bool {
+        for(const auto machine_id : machines) {
+            if(!allow_protected_hosts && protected_machines.find(machine_id) != protected_machines.end()) {
+                skipped_any_protected_machine = true;
+                protected_machine_skips++;
+                continue;
+            }
+
         VMId_t vm_id = VMId_t(-1);
         const bool has_reusable_vm = HasReusableVM(machine_id, required_vm, required_cpu, vm_id);
         const bool creating_vm = !has_reusable_vm;
@@ -154,7 +364,20 @@ bool Scheduler::TryPlaceTask(TaskId_t task_id) {
         task_it->second.assigned = true;
         task_it->second.assigned_vm = vm_id;
         successful_placements++;
+            return true;
+        }
+        return false;
+    };
+
+    if(try_pass(false)) {
         return true;
+    }
+
+    // If all candidates were protected, allow only top-priority classes to spill over.
+    if(skipped_any_protected_machine && priority == HIGH_PRIORITY) {
+        if(try_pass(true)) {
+            return true;
+        }
     }
 
     return false;
@@ -210,6 +433,7 @@ void Scheduler::Init() {
     task_states.clear();
     vm_states.clear();
     task_to_vm.clear();
+    vm_last_migration_time.clear();
     retry_queue.clear();
     failed_task_ids.clear();
 
@@ -223,6 +447,8 @@ void Scheduler::Init() {
     vms_created = 0;
     migrations = 0;
     wakeups = 0;
+    at_risk_tasks_detected = 0;
+    protected_machine_skips = 0;
 
     InitializeMachineViews();
     RefreshMachineStatesFromSimulator();
@@ -236,7 +462,11 @@ void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
     auto vm_it = vm_states.find(vm_id);
     if(vm_it != vm_states.end()) {
         vm_it->second.migrating = false;
+        const VMInfo_t vm_info = VM_GetInfo(vm_id);
+        vm_it->second.machine_id = vm_info.machine_id;
     }
+
+    RefreshMachineStatesFromSimulator();
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
@@ -286,6 +516,9 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
 
     tasks_seen++;
 
+    RefreshMachineStatesFromSimulator();
+    RefreshProtectedMachines(now);
+
     if(!TryPlaceTask(task_id)) {
         EnqueueRetry(task_id);
     }
@@ -296,7 +529,17 @@ void Scheduler::PeriodicCheck(Time_t now) {
     // SchedulerCheck is called periodically by the simulator to allow you to monitor, make decisions, adjustments, etc.
     // Unlike the other invocations of the scheduler, this one doesn't report any specific event
     // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
+    // MVP phase 8: Refresh dynamic machine state before processing retries to reduce stale-state effects.
+    RefreshMachineStatesFromSimulator();
+    RefreshProtectedMachines(now);
+    ProcessAtRiskMigrations(now);
     ProcessRetryQueue(now);
+}
+
+void Scheduler::SLAWarn(Time_t now, TaskId_t task_id) {
+    RefreshMachineStatesFromSimulator();
+    RefreshProtectedMachines(now);
+    (void)TryMigrateAtRiskTask(task_id, now, true);
 }
 
 void Scheduler::Shutdown(Time_t time) {
@@ -314,6 +557,8 @@ void Scheduler::Shutdown(Time_t time) {
     cout << "VMs created: " << vms_created << endl;
     cout << "Migrations: " << migrations << endl;
     cout << "Wakeups: " << wakeups << endl;
+    cout << "At-risk tasks detected: " << at_risk_tasks_detected << endl;
+    cout << "Protected-machine skips: " << protected_machine_skips << endl;
     cout << "Failed task IDs: ";
     if(failed_task_ids.empty()) {
         cout << "none";
@@ -339,6 +584,8 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     // Decide if a machine is to be turned off, slowed down, or VMs to be migrated according to your policy
     // This is an opportunity to make any adjustments to optimize performance/energy
     SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " is complete at " + to_string(now), 4);
+
+    RefreshMachineStatesFromSimulator();
 
     auto task_it = task_states.find(task_id);
     if(task_it == task_states.end()) {
@@ -390,16 +637,14 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
     task_it->second.assigned = false;
     task_it->second.assigned_vm = VMId_t(-1);
 
-    if(vm_state.active_tasks.empty() && !vm_state.migrating) {
-        VM_Shutdown(vm_id);
+    // MVP phase 7: Keep empty VMs alive for future reuse rather than shutdown.
+    // Future post-MVP phases will implement consolidation/shutdown policy.
+    // (VM reuse reduces VM creation churn during burst recovery.)
 
-        if(machine_it != machine_views.end()) {
-            machine_it->second.active_vms.erase(vm_id);
-        }
-
-        vm_states.erase(vm_it);
-    }
+    RefreshMachineStatesFromSimulator();
+    RefreshProtectedMachines(now);
 }
+
 
 // Public interface below
 
@@ -451,8 +696,7 @@ void SimulationComplete(Time_t time) {
 }
 
 void SLAWarning(Time_t time, TaskId_t task_id) {
-    (void)time;
-    (void)task_id;
+    Scheduler.SLAWarn(time, task_id);
 }
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
