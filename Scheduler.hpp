@@ -28,6 +28,9 @@ private:
     float GetEfficiencyScore(MachineId_t) const;
     void SortByEfficiency(vector<MachineId_t>&);
     void PrintMachineBuckets() const;
+    const vector<MachineId_t>& GetMachineBucket(MachineId_t machine_id) const;
+    unsigned CountAwakeMachines(const vector<MachineId_t>& bucket) const;
+    bool ShouldSleepMachine(MachineId_t machine_id, Time_t now) const;
     pair<const vector<MachineId_t>*, const vector<MachineId_t>*> GetCandidateBuckets(TaskId_t task_id) const;
     bool CanHostTask(MachineId_t machine_id, TaskId_t task_id) const;
     MachineId_t FindFeasibleMachine(TaskId_t task_id) const;
@@ -46,6 +49,7 @@ private:
     vector<VMId_t> task_to_vm;
     vector<bool> machine_transitioning;
     vector<bool> machine_waking;
+    vector<Time_t> machine_last_busy_time;
     vector<TaskId_t> waiting_tasks;
     bool retry_waiting_tasks_pending = false;
     unsigned completed_tasks = 0;

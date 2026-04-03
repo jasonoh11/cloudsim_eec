@@ -11,6 +11,9 @@
 
 static bool migrating = false;
 static unsigned active_machines = 0;
+static constexpr Time_t IDLE_SLEEP_THRESHOLD = 30000000;
+static constexpr unsigned MIN_AWAKE_MACHINES_PER_BUCKET = 1;
+static constexpr MachineState_t IDLE_SLEEP_STATE = S3;
 
 static Priority_t GetPriorityForTask(TaskId_t task_id) {
     switch (RequiredSLA(task_id)) {
@@ -66,6 +69,48 @@ void Scheduler::SortByEfficiency(vector<MachineId_t>& machines) {
         [this](MachineId_t a, MachineId_t b) {
             return GetEfficiencyScore(a) > GetEfficiencyScore(b);
         });
+}
+
+const vector<MachineId_t>& Scheduler::GetMachineBucket(MachineId_t machine_id) const {
+    MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+    unsigned cpu_index = static_cast<unsigned>(machine_info.cpu);
+    return machine_info.gpus
+         ? gpu_machines_by_cpu[cpu_index]
+         : non_gpu_machines_by_cpu[cpu_index];
+}
+
+unsigned Scheduler::CountAwakeMachines(const vector<MachineId_t>& bucket) const {
+    unsigned awake_machines = 0;
+    for (MachineId_t machine_id : bucket) {
+        if (machine_transitioning[machine_id]) {
+            continue;
+        }
+
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+        if (machine_info.s_state == S0) {
+            awake_machines++;
+        }
+    }
+    return awake_machines;
+}
+
+bool Scheduler::ShouldSleepMachine(MachineId_t machine_id, Time_t now) const {
+    if (machine_transitioning[machine_id] || machine_waking[machine_id] || !waiting_tasks.empty()) {
+        return false;
+    }
+
+    MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+    if (machine_info.s_state != S0 || machine_info.active_tasks != 0) {
+        return false;
+    }
+
+    if (now < machine_last_busy_time[machine_id]
+        || now - machine_last_busy_time[machine_id] < IDLE_SLEEP_THRESHOLD) {
+        return false;
+    }
+
+    const vector<MachineId_t>& bucket = GetMachineBucket(machine_id);
+    return CountAwakeMachines(bucket) > MIN_AWAKE_MACHINES_PER_BUCKET;
 }
 
 pair<const vector<MachineId_t>*, const vector<MachineId_t>*> Scheduler::GetCandidateBuckets(TaskId_t task_id) const {
@@ -269,6 +314,7 @@ void Scheduler::Init() {
     task_to_vm.resize(GetNumTasks(), static_cast<VMId_t>(-1));
     machine_transitioning.resize(active_machines, false);
     machine_waking.resize(active_machines, false);
+    machine_last_busy_time.resize(active_machines, 0);
 
 
     for(unsigned i = 0; i < active_machines; i++) {
@@ -309,7 +355,7 @@ void Scheduler::HandleMachineWake(Time_t time, MachineId_t machine_id) {
         return;
     }
 
-    if (was_waking) {
+        if (was_waking) {
         RetryWaitingTasks(time);
     }
 }
@@ -388,6 +434,7 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         }
         VM_AddTask(selected_vm, task_id, GetPriorityForTask(task_id));
         task_to_vm[task_id] = selected_vm;
+        machine_last_busy_time[selected_machine] = now;
     }
 }
 
@@ -405,6 +452,24 @@ void Scheduler::PeriodicCheck(Time_t now) {
         SimOutput("PeriodicCheck(): retrying waiting tasks outside TaskComplete callback", 1);
         retry_waiting_tasks_pending = false;
         RetryWaitingTasks(now);
+    }
+
+    for (MachineId_t machine_id = 0; machine_id < active_machines; machine_id++) {
+        MachineInfo_t machine_info = Machine_GetInfo(machine_id);
+        if (machine_info.active_tasks > 0) {
+            machine_last_busy_time[machine_id] = now;
+            continue;
+        }
+
+        if (!ShouldSleepMachine(machine_id, now)) {
+            continue;
+        }
+
+        machine_transitioning[machine_id] = true;
+        Machine_SetState(machine_id, IDLE_SLEEP_STATE);
+        SimOutput("PeriodicCheck(): sleeping idle machine " + to_string(machine_id)
+                  + " after " + to_string(now - machine_last_busy_time[machine_id])
+                  + "us idle", 1);
     }
 
     if (now - last_heartbeat >= heartbeat_interval) {
@@ -492,12 +557,7 @@ void Scheduler::Shutdown(Time_t time) {
     // Do your final reporting and bookkeeping here.
     // Report about the total energy consumed
     // Report about the SLA compliance
-    // Shutdown everything to be tidy :-)
-    for (MachineId_t machine_id = 0; machine_id < machine_to_vms.size(); machine_id++) {
-        for (VMId_t vm_id : machine_to_vms[machine_id]) {
-            VM_Shutdown(vm_id);
-        }
-    }
+    // Avoid teardown-time exceptions from VMs attached to sleeping machines.
     SimOutput("SimulationComplete(): Finished!", 3);
     SimOutput("SimulationComplete(): Time is " + to_string(time), 3);
 }
