@@ -20,90 +20,90 @@ Sources:
 
 ## Big_Small
 
-| Run | SLA0 | SLA1 | SLA2 | Retry Enqueues | Retry Attempts | VMs Created | Placement Failures | Total Retry Misses | Notes |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| H | 88.8417% | 58.5366% | 0% | 0 | 0 | 3 | - | - | Previous implementation |
-| I | 0.0499251% | 0% | 0% | 3841 | 3532384 | 24 | 0 | 3528543 | Current run-v result |
+| Run | SLA0 | SLA1 | SLA2 | Energy (KW-Hour) | Retry Enqueues | Retry Attempts | VMs Created | Placement Failures | Total Retry Misses | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| H | 88.8417% | 58.5366% | 0% | - | 0 | 0 | 3 | - | - | Previous implementation |
+| I | 0.0499251% | 0% | 0% | 0.029202 | 3841 | 3532384 | 24 | 0 | 3528543 | Current run-v result |
 
 ## canvas.txt
 
-| Run | SLA0 | SLA1 | SLA2 | Retry Enqueues | Retry Attempts | VMs Created | Placement Failures | Total Retry Misses | Notes |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| I | 0% | 0% | 0% | 0 | 0 | 27 | 0 | 0 | Current run-v result |
+| Run | SLA0 | SLA1 | SLA2 | Energy (KW-Hour) | Retry Enqueues | Retry Attempts | VMs Created | Placement Failures | Total Retry Misses | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| I | 0% | 0% | 0% | 7.27281 | 0 | 0 | 27 | 0 | 0 | Current run-v result |
 
 ## Day
 
-| Run | SLA0 | SLA1 | SLA2 | Retry Enqueues | Retry Attempts | VMs Created | Placement Failures | Total Retry Misses | Notes |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| I | 0% | 0% | 0% | 0 | 0 | 2 | 0 | 0 | Current run-v result |
+| Run | SLA0 | SLA1 | SLA2 | Energy (KW-Hour) | Retry Enqueues | Retry Attempts | VMs Created | Placement Failures | Total Retry Misses | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| I | 0% | 0% | 0% | 64.0121 | 0 | 0 | 2 | 0 | 0 | Current run-v result |
 
 ## Gentler_Hour
 
-| Run | SLA0 | SLA1 | SLA2 | Retry Enqueues | Retry Attempts | VMs Created | Placement Failures | Total Retry Misses | Notes |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| A | 75.873% | 93.4399% | 6.90742% | 6 | 33 | 4478 | - | - | Historical baseline |
-| B | 75.873% | 93.3595% | 6.95695% | 6 | 33 | 10 | - | - | Keep-empty-VMs variant |
-| C | 13.6508% | 86.8586% | 5.59708% | 6 | 33 | 11 | - | - | Host protection |
-| D | 57.7778% | 84.3436% | 5.471% | 6 | 33 | 15 | - | - | Migration v1 |
-| H | 13.6508% | 86.8586% | 5.59708% | 10 | 78 | 11 | - | - | Parallel batch |
-| I | 0% | 0% | 0% | 0 | 0 | 23 | 0 | 0 | Current run-v result |
+| Run | SLA0 | SLA1 | SLA2 | Energy (KW-Hour) | Retry Enqueues | Retry Attempts | VMs Created | Placement Failures | Total Retry Misses | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| A | 75.873% | 93.4399% | 6.90742% | - | 6 | 33 | 4478 | - | - | Historical baseline |
+| B | 75.873% | 93.3595% | 6.95695% | - | 6 | 33 | 10 | - | - | Keep-empty-VMs variant |
+| C | 13.6508% | 86.8586% | 5.59708% | - | 6 | 33 | 11 | - | - | Host protection |
+| D | 57.7778% | 84.3436% | 5.471% | - | 6 | 33 | 15 | - | - | Migration v1 |
+| H | 13.6508% | 86.8586% | 5.59708% | - | 10 | 78 | 11 | - | - | Parallel batch |
+| I | 0% | 0% | 0% | 7.25414 | 0 | 0 | 23 | 0 | 0 | Current run-v result |
 
 ## Input
 
-| Run | SLA0 | SLA1 | SLA2 | Retry Enqueues | Retry Attempts | VMs Created | Placement Failures | Total Retry Misses | Notes |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| H | 0% | 0% | 14.0969% | 54 | 10964 | 14 | - | - | Previous implementation |
-| I | 0% | 0% | 0% | 53 | 15789 | 14 | 0 | 15736 | Current run-v result |
+| Run | SLA0 | SLA1 | SLA2 | Energy (KW-Hour) | Retry Enqueues | Retry Attempts | VMs Created | Placement Failures | Total Retry Misses | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| H | 0% | 0% | 14.0969% | - | 54 | 10964 | 14 | - | - | Previous implementation |
+| I | 0% | 0% | 0% | 0.0124647 | 53 | 15789 | 14 | 0 | 15736 | Current run-v result |
 
 ## Match_Me_If_You_Can
 
-| Run | SLA0 | SLA1 | SLA2 | Retry Enqueues | Retry Attempts | VMs Created | Placement Failures | Total Retry Misses | Notes |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| A | 88.5671% | 58.5366% | 0% | 0 | 0 | 8 | - | - | Historical baseline |
-| B | 88.4923% | 58.5366% | 0% | 0 | 0 | 3 | - | - | Keep-empty-VMs variant |
-| C | 88.4423% | 58.5366% | 0% | 0 | 0 | 3 | - | - | Host protection |
-| D | 92.012% | 58.5366% | 0% | 0 | 0 | 3 | - | - | Migration v1 |
-| H | 88.8417% | 58.5366% | 0% | 0 | 0 | 3 | - | - | Parallel batch |
-| I | 0% | 0% | 0% | 1671 | 1001785 | 40 | 0 | 1000114 | Current run-v result |
+| Run | SLA0 | SLA1 | SLA2 | Energy (KW-Hour) | Retry Enqueues | Retry Attempts | VMs Created | Placement Failures | Total Retry Misses | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| A | 88.5671% | 58.5366% | 0% | - | 0 | 0 | 8 | - | - | Historical baseline |
+| B | 88.4923% | 58.5366% | 0% | - | 0 | 0 | 3 | - | - | Keep-empty-VMs variant |
+| C | 88.4423% | 58.5366% | 0% | - | 0 | 0 | 3 | - | - | Host protection |
+| D | 92.012% | 58.5366% | 0% | - | 0 | 0 | 3 | - | - | Migration v1 |
+| H | 88.8417% | 58.5366% | 0% | - | 0 | 0 | 3 | - | - | Parallel batch |
+| I | 0% | 0% | 0% | 0.045626 | 1671 | 1001785 | 40 | 0 | 1000114 | Current run-v result |
 
 ## Nice_and_Smooth
 
-| Run | SLA0 | SLA1 | SLA2 | Retry Enqueues | Retry Attempts | VMs Created | Placement Failures | Total Retry Misses | Notes |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| H | 0% | 0% | 0% | 0 | 0 | 1 | - | - | Previous implementation |
-| I | 0% | 0% | 0% | 0 | 0 | 1 | 0 | 0 | Current run-v result |
+| Run | SLA0 | SLA1 | SLA2 | Energy (KW-Hour) | Retry Enqueues | Retry Attempts | VMs Created | Placement Failures | Total Retry Misses | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| H | 0% | 0% | 0% | - | 0 | 0 | 1 | - | - | Previous implementation |
+| I | 0% | 0% | 0% | 0.0121098 | 0 | 0 | 1 | 0 | 0 | Current run-v result |
 
 ## Spikey_Mean
 
-| Run | SLA0 | SLA1 | SLA2 | Retry Enqueues | Retry Attempts | VMs Created | Migrations | Placement Failures | Total Retry Misses | Notes |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| A | 88.5671% | 58.5366% | 0% | 0 | 0 | 8 | 0 | - | - | Historical baseline |
-| B | 88.4923% | 58.5366% | 0% | 0 | 0 | 3 | 0 | - | - | Keep-empty-VMs variant |
-| C | 88.4423% | 58.5366% | 0% | 0 | 0 | 3 | 0 | - | - | Host protection |
-| D | 92.012% | 58.5366% | 0% | 0 | 0 | 3 | 48 | - | - | Migration v1 |
-| E | 89.4159% | 58.5366% | 0% | 0 | 0 | 3 | 41 | - | - | Migration v1.1 |
-| F | 88.8417% | 58.5366% | 0% | 0 | 0 | 3 | 37 | - | - | Headroom 0.70 |
-| G | 88.8417% | 58.5366% | 0% | 0 | 0 | 3 | 37 | - | - | Urgent migration only |
-| H | 88.8417% | 58.5366% | 0% | 0 | 0 | 3 | 0 | - | - | Parallel batch |
-| I | 0% | 0% | 0% | 3875 | 3626180 | 16 | 0 | 0 | 3622305 | Current run-v result |
+| Run | SLA0 | SLA1 | SLA2 | Energy (KW-Hour) | Retry Enqueues | Retry Attempts | VMs Created | Migrations | Placement Failures | Total Retry Misses | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| A | 88.5671% | 58.5366% | 0% | - | 0 | 0 | 8 | 0 | - | - | Historical baseline |
+| B | 88.4923% | 58.5366% | 0% | - | 0 | 0 | 3 | 0 | - | - | Keep-empty-VMs variant |
+| C | 88.4423% | 58.5366% | 0% | - | 0 | 0 | 3 | 0 | - | - | Host protection |
+| D | 92.012% | 58.5366% | 0% | - | 0 | 0 | 3 | 48 | - | - | Migration v1 |
+| E | 89.4159% | 58.5366% | 0% | - | 0 | 0 | 3 | 41 | - | - | Migration v1.1 |
+| F | 88.8417% | 58.5366% | 0% | - | 0 | 0 | 3 | 37 | - | - | Headroom 0.70 |
+| G | 88.8417% | 58.5366% | 0% | - | 0 | 0 | 3 | 37 | - | - | Urgent migration only |
+| H | 88.8417% | 58.5366% | 0% | - | 0 | 0 | 3 | 0 | - | - | Parallel batch |
+| I | 0% | 0% | 0% | 0.0250182 | 3875 | 3626180 | 16 | 0 | 0 | 3622305 | Current run-v result |
 
 ## SpikeyNefarious
 
-| Run | SLA0 | SLA1 | SLA2 | Retry Enqueues | Retry Attempts | VMs Created | Placement Failures | Total Retry Misses | Notes |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| H | 52.5397% | 37.8049% | 0% | 0 | 0 | 2 | - | - | Previous implementation |
-| I | 0% | 0% | 0% | 0 | 0 | 16 | 0 | 0 | Current run-v result |
+| Run | SLA0 | SLA1 | SLA2 | Energy (KW-Hour) | Retry Enqueues | Retry Attempts | VMs Created | Placement Failures | Total Retry Misses | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| H | 52.5397% | 37.8049% | 0% | - | 0 | 0 | 2 | - | - | Previous implementation |
+| I | 0% | 0% | 0% | 0.0116119 | 0 | 0 | 16 | 0 | 0 | Current run-v result |
 
 ## Tall_Short
 
-| Run | SLA0 | SLA1 | SLA2 | Retry Enqueues | Retry Attempts | VMs Created | Migrations | Placement Failures | Total Retry Misses | Notes |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| A | 100% | 58.5366% | 0% | 0 | 0 | 8 | 0 | - | - | Historical baseline |
-| B | 100% | 58.5366% | 0% | 0 | 0 | 3 | 0 | - | - | Keep-empty-VMs variant |
-| C | 100% | 58.5366% | 0% | 0 | 0 | 3 | 0 | - | - | Host protection |
-| D | 100% | 58.5366% | 0% | 0 | 0 | 3 | 69 | - | - | Migration v1 |
-| H | 100% | 58.5366% | 0% | 0 | 0 | 3 | 0 | - | - | Parallel batch |
-| I | 40.4393% | 0% | 0% | 3846 | 4714178 | 24 | 0 | 0 | 4710332 | Current run-v result |
+| Run | SLA0 | SLA1 | SLA2 | Energy (KW-Hour) | Retry Enqueues | Retry Attempts | VMs Created | Migrations | Placement Failures | Total Retry Misses | Notes |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| A | 100% | 58.5366% | 0% | - | 0 | 0 | 8 | 0 | - | - | Historical baseline |
+| B | 100% | 58.5366% | 0% | - | 0 | 0 | 3 | 0 | - | - | Keep-empty-VMs variant |
+| C | 100% | 58.5366% | 0% | - | 0 | 0 | 3 | 0 | - | - | Host protection |
+| D | 100% | 58.5366% | 0% | - | 0 | 0 | 3 | 69 | - | - | Migration v1 |
+| H | 100% | 58.5366% | 0% | - | 0 | 0 | 3 | 0 | - | - | Parallel batch |
+| I | 40.4393% | 0% | 0% | 0.0351485 | 3846 | 4714178 | 24 | 0 | 0 | 4710332 | Current run-v result |
 
 ## Run I Full End-of-Run Statistics
 
