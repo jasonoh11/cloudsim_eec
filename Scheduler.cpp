@@ -52,49 +52,19 @@ void Scheduler::ClassifyMachinesIntoTiers() {
     const unsigned total = static_cast<unsigned>(machines.size());
     if(total == 0) return;
 
-    const unsigned running_count = max(kMinRunningMachines,
-        static_cast<unsigned>(ceil(static_cast<double>(total) * kInitialRunningFraction)));
-
-    const unsigned intermediate_max = total - running_count;
-    const unsigned intermediate_count = max(kMinIntermediateMachines,
-        min(static_cast<unsigned>(ceil(static_cast<double>(total) * kInitialIntermediateFraction)),
-            intermediate_max));
-
     for(unsigned i = 0; i < total; i++) {
         const MachineId_t machine_id = sorted_machines[i];
         auto &view = machine_views[machine_id];
-
-        if(i < running_count) {
-            machine_tier[machine_id] = MachineTier::Running;
-            if(view.s_state != S0) {
-                Machine_SetState(machine_id, S0);
-                view.state_change_pending = true;
-                view.target_state         = S0;
-            }
-
-        } else if(i < running_count + intermediate_count) {
-            machine_tier[machine_id] = MachineTier::Intermediate;
-            if(view.s_state != S1) {
-                Machine_SetState(machine_id, S1);
-                view.state_change_pending = true;
-                view.target_state         = S1;
-            }
-
-        } else {
-            machine_tier[machine_id] = MachineTier::SwitchedOff;
-            if(view.s_state != S5) {
-                Machine_SetState(machine_id, S5);
-                view.state_change_pending = true;
-                view.target_state         = S5;
-            }
+        machine_tier[machine_id] = MachineTier::Running;
+        if(view.s_state != S0) {
+            Machine_SetState(machine_id, S0);
+            view.state_change_pending = true;
+            view.target_state         = S0;
         }
     }
-
-    SimOutput("ClassifyMachinesIntoTiers(): Running=" + to_string(running_count)
-              + " Intermediate=" + to_string(intermediate_count)
-              + " SwitchedOff=" + to_string(total - running_count - intermediate_count), 2);
+    SimOutput("ClassifyMachinesIntoTiers(): all " + to_string(total)
+              + " machines targeted S0; E-Eco will demote idle ones over time", 2);
 }
-
 
 // =============================================================================
 // SECTION 2 — Shadow state sync
@@ -138,13 +108,14 @@ Priority_t Scheduler::PriorityFromSLA(SLAType_t sla) const {
 }
 
 double Scheduler::MaxLoadForSLA(SLAType_t sla) const {
-    switch(sla) {
-        case SLA0:  return kLoadCapSLA0;
-        case SLA1:  return kLoadCapSLA1;
-        case SLA2:  return kLoadCapSLA2;
-        case SLA3:
-        default:    return kLoadCapSLA3;
-    }
+    // switch(sla) {
+    //     case SLA0:  return kLoadCapSLA0;
+    //     case SLA1:  return kLoadCapSLA1;
+    //     case SLA2:  return kLoadCapSLA2;
+    //     case SLA3:
+    //     default:    return kLoadCapSLA3;
+    // }
+    return 1.0;
 }
 
 unsigned Scheduler::AdditionalPlacementMemory(TaskId_t task_id, bool creating_vm) const {
@@ -664,25 +635,22 @@ void Scheduler::HandleMachineWake(Time_t time, MachineId_t machine_id) {
     machine.s_state = info.s_state;
 
     if(info.s_state != machine.target_state) {
-        // Still transitioning — do not clear pending flag.
         SimOutput("HandleMachineWake(): machine " + to_string(machine_id)
-                  + " at S" + to_string(info.s_state)
-                  + " en route to S" + to_string(machine.target_state)
-                  + " — still transitioning", 3);
+                  + " still transitioning to S" + to_string(machine.target_state), 3);
         return;
     }
 
-    // Reached the commanded target.
     machine.state_change_pending = false;
-    machine.tracked_memory_used  = info.memory_used;
-    machine.active_task_count    = info.active_tasks;
+    // machine.tracked_memory_used  = info.memory_used;
+    // machine.active_task_count    = info.active_tasks;
 
     if(info.s_state == S0) {
         machine_tier[machine_id] = MachineTier::Running;
         SimOutput("HandleMachineWake(): machine " + to_string(machine_id)
-                  + " confirmed S0 at time " + to_string(time)
-                  + " — draining retry queue", 2);
-        ProcessRetryQueue(time);
+                  + " confirmed S0 at time " + to_string(time), 2);
+        // NO ProcessRetryQueue here — PeriodicCheck drives all placement.
+        // Draining the queue from HandleMachineWake caused concurrent
+        // VM_AddTask bursts when multiple machines wake at the same timestamp.
 
     } else if(info.s_state == S1 || info.s_state == S2) {
         machine_tier[machine_id] = MachineTier::Intermediate;
@@ -784,6 +752,10 @@ void Scheduler::Shutdown(Time_t time) {
     cout << endl;
 
     for(auto &kv : vm_states) {
+        const VMState &vm = kv.second;
+        const auto machine_it = machine_views.find(vm.machine_id);
+        if(machine_it == machine_views.end()) continue;
+        if(machine_it->second.s_state != S0) continue;  // ← add this
         VM_Shutdown(kv.first);
     }
     SimOutput("SimulationComplete(): finished at time " + to_string(time), 4);
