@@ -1,209 +1,150 @@
 # CloudSim EEC Scheduler
 
-This repository contains a Cloud simulator and a Greedy scheduler implementation for VM/task placement, retry handling, and end-of-run reporting.
+This repository contains the CloudSim simulator and the current scheduler implementation in `Scheduler.cpp` and `Scheduler.hpp`.
 
 ## Project Layout
 
-- `Scheduler.hpp` / `Scheduler.cpp`: scheduler policy and bookkeeping.
-- `Interfaces.h`: public simulator/scheduler APIs.
+- `Scheduler.hpp`, `Scheduler.cpp`: scheduling policy, shadow-state accounting, retry handling, wake handling, and end-of-run reporting.
+- `Interfaces.h`: scheduler-facing public simulator APIs.
 - `Internal_Interfaces.h`: internal simulator APIs.
-- `SimTypes.h`: shared enums and structs (tasks, machines, VMs, states).
-- `Makefile`: build and run helpers, including timestamped log targets.
-- `tmp/Input`: original workload input.
-- `tmp/run_logs`: generated run logs.
+- `SimTypes.h`: shared enums and data structures (machine/task/VM metadata).
+- `Makefile`: build and run targets (`run-v`, `run-v4`, and logged variants).
+- `tmp/`: workload input files.
+- `tmp/run_logs/`: generated run logs.
 
-## Scheduler Design
+## Current Scheduler Implementation
 
-### Policy Summary
+### Core Placement Policy
 
-The current scheduler implements a memory-aware, first-fit Greedy policy:
+The scheduler is first-fit placement with VM reuse, guided by SLA-aware machine ordering and load caps:
 
-1. Place each new task onto the first feasible machine (lowest machine ID order).
-2. Prefer reusing an existing compatible VM on that machine.
-3. Create a new compatible VM only if no reusable VM exists.
-4. Enforce capacity cap using memory utilization: `projected_memory / machine_memory < 0.80`.
-5. Restrict placement to machines in `S0` and with matching CPU type.
-6. If immediate placement fails, enqueue the task for periodic retries.
-7. Retries continue on each periodic scheduler tick until task placement succeeds.
+1. New task arrives in `NewTask()`.
+2. Task priority is set from SLA and mirrored in simulator metadata via `SetTaskPriority`.
+3. `TryPlaceTask()` scans machines in a precomputed `sorted_machines` list (fastest to slowest by `mips_p0`).
+4. For each machine, scheduler prefers reusing a compatible VM; otherwise it creates a new VM.
+5. Placement feasibility is checked by `IsMachineFeasible()`.
 
-### Priority Mapping
+### Feasibility Rules
 
-Task priorities are derived from SLA and pushed into simulator task metadata:
+`IsMachineFeasible()` currently requires:
 
-- `SLA0`, `SLA1` -> `HIGH_PRIORITY`
-- `SLA2` -> `MID_PRIORITY`
-- `SLA3` -> `LOW_PRIORITY`
+- machine in `S0`
+- `state_change_pending == false`
+- CPU type match
+- GPU match for GPU-capable tasks
+- raw memory fit (`projected_memory < machine_memory`)
+- projected load (`(active_tasks + 1) / num_cores`) below SLA-specific cap
 
-### Internal Bookkeeping
+Load caps by SLA (`MaxLoadForSLA`):
 
-The scheduler tracks its own mirrors of simulator state:
+- `SLA0`: `<= 1.0` tasks per core
+- `SLA1`: `<= 2.0` tasks per core
+- `SLA2`: `<= 4.0` tasks per core
+- `SLA3`: `<= 8.0` tasks per core
 
-- Machine view:
-	- memory capacity and tracked usage
-	- machine power state
-	- active VM set and active task count
-- VM view:
-	- host machine
-	- CPU/VM type
-	- active task set and tracked memory footprint
-	- migration-in-progress flag
-- Task view:
-	- required CPU/VM/SLA/memory metadata
-	- assigned priority
-	- placement/assignment/completion fields
-	- retry count
-- Retry queue:
-	- FIFO queue processed during `SchedulerCheck`.
+### Placement Direction by SLA
 
-### Completion Behavior
+- `SLA0` and `SLA1` iterate fast-to-slow, so urgent work prefers faster machines.
+- `SLA2` and `SLA3` iterate slow-to-fast, leaving faster machines available for tighter-SLA work.
 
-On task completion, the scheduler:
+### Retry Queue Behavior
 
-1. Marks the task as completed.
-2. Updates VM and machine tracked memory/task counts.
-3. Clears task-to-VM assignment mapping.
-4. Shuts down empty VMs.
+- Failed immediate placements are enqueued by `EnqueueRetry()`.
+- `ProcessRetryQueue()` processes up to `kRetryBatchCap = 1000` entries per call.
+- Tasks are re-enqueued while capacity-constrained.
+- Tasks are permanently failed only when no compatible hardware exists (`IsHardwareCompatible == false`).
+- `retry_count` and `Total retry misses` are diagnostic counters; they do not force failure.
 
-Note: the simulator removes tasks from VMs before `HandleTaskCompletion` callback, so scheduler-side completion logic only updates scheduler mirrors and does not call `VM_RemoveTask`.
+### Wake Handling
 
-## End-of-Run Reporting
+- `Init()` issues `Machine_SetState(..., S0)` for all machines and marks `state_change_pending` while transitions complete.
+- `StateChangeComplete()` delegates to `HandleMachineWake()`.
+- `HandleMachineWake()` clears pending state, refreshes that machine's shadow view, and immediately drains retry queue.
 
-At simulation completion, output includes:
+### Periodic and Event Flow
 
-- SLA violation report from simulator (`SLA0`, `SLA1`, `SLA2`)
-- Total energy consumed
-- Simulated runtime
-- Scheduler report:
-	- tasks seen
-	- tasks completed
-	- successful placements
-	- retry enqueues
-	- retry attempts
-	- placement failures
-	- VMs created
-	- migrations
-	- wakeups
-	- failed task IDs
+- `PeriodicCheck(now)`: refresh machine state from simulator, then process retry queue.
+- `SLAWarn(now, task_id)`: currently uses warning as another opportunity to process retries.
+- `TaskComplete(now, task_id)`: updates shadow memory/load immediately and triggers retry processing if queue is non-empty.
+- `MigrationComplete(...)`: implemented as a no-op callback (scheduler does not actively migrate in this implementation).
 
-## Build Instructions
+### State Mirrors and Accounting
 
-Build all:
+Scheduler keeps mirrored state for:
+
+- machines: `machine_views` (includes cores, P0 MIPS, memory, GPU, state, active-task count)
+- VMs: `vm_states`
+- tasks: `task_states`
+- per-machine VM index: `machine_to_vms`
+- retry queue and failed task IDs
+- counters (`tasks_seen`, `retry_attempts`, `placement_failures`, `vms_created`, and `Total retry misses`)
+
+Important design point: `RefreshMachineStatesFromSimulator()` is called only from `PeriodicCheck()` to avoid overwriting shadow updates mid-burst.
+
+### Shutdown Reporting
+
+At simulation end (`SimulationComplete()` then `Scheduler::Shutdown()`), output includes:
+
+- SLA0/SLA1/SLA2 percentages
+- total cluster energy
+- simulated runtime
+- scheduler counters:
+  - tasks seen/completed
+  - successful placements
+  - retry enqueues/attempts
+  - placement failures
+  - VMs created
+  - total retry misses
+  - failed task IDs
+
+## Build
 
 ```bash
 make all
 ```
 
-This produces executable `./simulator`.
+Build artifact: `./simulator`
 
-## Run Instructions
+## Run
 
-### Direct run
+Direct:
 
 ```bash
 ./simulator
 ```
 
-### Verbose runs
+Verbose presets:
 
 ```bash
-make run-v           # verbose level 3
-make run-v4          # verbose level 4 (scheduler-level visibility)
+make run-v           # -v 3
+make run-v4          # -v 4
 ```
 
-You can override input path:
+Custom input:
 
 ```bash
-make run-v4 INPUT=./tmp/Input
+make run-v INPUT=./tmp/Input
 ```
 
-### Logged runs (recommended)
+Logged runs:
 
 ```bash
-make run-log         # default verbosity
-make run-v-log       # verbosity 3
-make run-v4-log      # verbosity 4
+make run-log
+make run-v-log
+make run-v4-log
 ```
 
-With custom label and input:
+Example:
 
 ```bash
-make run-v4-log LABEL=testinputretryfix INPUT=./tmp/Input
+make run-v-log LABEL=spikey_mean INPUT=./tmp/Spikey_Mean
 ```
 
-Logs are written to:
+Logs are written under `tmp/run_logs/`.
 
-- `tmp/run_logs/<LABEL>_<YYYYMMDD_HHMMSS>.log`
+## Notes
 
-## Practical Validation Workflow
-
-For long original-input runs:
-
-1. Start with a logged run.
-2. Heartbeat-check progress by sampling:
-	 - last `SchedulerCheck` time
-	 - task completion count
-	 - presence of exceptions
-3. Confirm completion marker and scheduler report at end.
-
-Useful checks:
-
-```bash
-grep -c "HandleNewTask(): Received new task" <log>
-grep -c "HandleTaskCompletion(): Task" <log>
-grep -c "SimulationComplete(): Simulation finished" <log>
-grep -E -c "Caught an exception|Bailing out|ThrowException" <log>
-```
-
-## Troubleshooting
-
-### Symptom: Log has one line then many NUL characters
-
-Cause: disk quota exceeded while writing log output. The simulator writes the first line, then later writes fail and output file may appear as one text line plus NUL padding.
-
-Fix:
-
-1. Free space in `tmp/run_logs` (older large logs).
-2. Re-run with lower verbosity for long tests (`run-v-log` or `run-log`).
-
-Check log directory size:
-
-```bash
-du -h tmp/run_logs
-ls -lhS tmp/run_logs | head
-```
-
-### Symptom: long run appears stuck
-
-Use heartbeat checks on latest log:
-
-- if simulated time and completion counts increase, it is progressing;
-- if both are flat for a long interval, inspect retry behavior and queue dynamics.
-
-## Final Policy Decision
-
-After comparing several migration experiments against the protection-only baseline on `Spikey Mean`, the active policy is now:
-
-1. `kCapacityCap = 0.70` for additional headroom.
-2. Proactive host protection for at-risk tasks.
-3. No active migration in the default path.
-
-Why:
-
-- Protection plus headroom consistently performed better than migration variants on the tested burst trace.
-- Migration added churn without improving SLA enough to justify keeping it in the active path.
-- The migration helpers remain in the code for future experimentation, but they are not part of the default policy.
-
-Tracked comparisons are maintained in [SLA_RUN_TRACKER.md](SLA_RUN_TRACKER.md).
-
-## Known Scope / Non-Goals (Current Implementation)
-
-Not currently implemented as active policy logic:
-
-- consolidation/migration strategy
-- wake/sleep machine state policy
-- P-state tuning policy
-- SLA warning response policy
-
-The scheduler tracks counters for these but does not actively drive those controls yet.
+- Historical experiment outcomes are tracked in `SLA_RUN_TRACKER.md`.
+- This README reflects the current code in `Scheduler.cpp` / `Scheduler.hpp`; use those files as the source of truth when experimenting with policy changes.
 
 
