@@ -46,6 +46,7 @@ private:
         MachineState_t s_state;
         unsigned       active_task_count;
         bool           state_change_pending; // true while waiting for S0 after Machine_SetState
+        Time_t         last_active_time;     // sim time when active_task_count last became 0
     };
 
     struct VMState {
@@ -87,6 +88,25 @@ private:
     static constexpr unsigned kRetryBatchCap      = 1000;
 
     // -----------------------------------------------------------------------
+    // Idle-shutdown policy constants.
+    //
+    // kIdleShutdownThreshold: how long (sim time units) a machine must be
+    //   continuously idle before it is eligible for shutdown.  5 000 000 units
+    //   is deliberately long (~5 simulated seconds) so that transient lulls
+    //   between bursts do not trigger unnecessary wake/sleep cycles.
+    //
+    // kMinS0Machines: the cluster always keeps at least this many S0 machines
+    //   per CPU type so there is always somewhere to land an arriving task
+    //   without paying a wake-up latency penalty.  Conservative: 2 per type.
+    //
+    // kShutdownBatchCap: maximum machines shut down per PeriodicCheck call.
+    //   Limits the blast radius if the heuristic misfires.
+    // -----------------------------------------------------------------------
+    static constexpr Time_t   kIdleShutdownThreshold = 2000000000ULL;  // 5 000 000 time units
+    static constexpr unsigned kMinS0MachinesPerCPU   = 6;  // keep more machines warm as buffer
+    static constexpr unsigned kShutdownBatchCap      = 1;
+
+    // -----------------------------------------------------------------------
     // Private methods
     // -----------------------------------------------------------------------
     void       InitializeMachineViews();
@@ -101,6 +121,11 @@ private:
     bool       TryPlaceTask(TaskId_t task_id);
     void       EnqueueRetry(TaskId_t task_id);
     void       ProcessRetryQueue(Time_t now);
+
+    // Idle-shutdown helpers.
+    void       ShutdownIdleMachines(Time_t now);
+    bool       WakeCompatibleMachine(CPUType_t cpu, bool need_gpu, Time_t now);
+    unsigned   CountS0Machines(CPUType_t cpu) const;
 
     // -----------------------------------------------------------------------
     // Data members
@@ -127,6 +152,8 @@ private:
     unsigned retry_attempts        = 0;
     unsigned placement_failures    = 0;
     unsigned vms_created           = 0;
+    unsigned machines_shut_down    = 0;   // new: tracks idle shutdowns
+    unsigned machines_woken        = 0;   // new: tracks demand-driven wakes
     vector<TaskId_t> failed_task_ids;
 };
 
