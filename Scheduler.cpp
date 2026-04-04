@@ -7,507 +7,405 @@
 
 #include "Scheduler.hpp"
 
+#include <algorithm>
 #include <limits>
 
+// ---------------------------------------------------------------------------
+// InitializeMachineViews
+// Build the shadow-state map from simulator ground truth.  Called once at
+// Init before any tasks arrive.
+// ---------------------------------------------------------------------------
 void Scheduler::InitializeMachineViews() {
     machines.clear();
     machine_views.clear();
 
-    const unsigned total_machines = Machine_GetTotal();
-    for(unsigned i = 0; i < total_machines; i++) {
-        const MachineId_t machine_id = MachineId_t(i);
-        const MachineInfo_t info = Machine_GetInfo(machine_id);
+    const unsigned total = Machine_GetTotal();
+    for(unsigned i = 0; i < total; i++) {
+        const MachineId_t   machine_id = MachineId_t(i);
+        const MachineInfo_t info       = Machine_GetInfo(machine_id);
 
         machines.push_back(machine_id);
         machine_views[machine_id] = MachineStateView{
             machine_id,
             info.cpu,
+            info.num_cpus,
+            info.performance[P0],   // MIPS at highest performance state
             info.memory_size,
             info.memory_used,
             info.gpus,
             info.s_state,
-            {},
             info.active_tasks,
-            false
+            false                   // state_change_pending
         };
     }
+
+    // Build sorted_machines: fastest (highest mips_p0) first.
+    sorted_machines = machines;
+    sort(sorted_machines.begin(), sorted_machines.end(),
+         [this](MachineId_t a, MachineId_t b) {
+             return machine_views[a].mips_p0 > machine_views[b].mips_p0;
+         });
 }
 
+// ---------------------------------------------------------------------------
+// RefreshMachineStatesFromSimulator
+// Overwrites tracked_memory_used, active_task_count, and s_state from the
+// simulator.  Called ONLY from PeriodicCheck so that shadow state accumulated
+// during a burst is never clobbered mid-event.
+// ---------------------------------------------------------------------------
 void Scheduler::RefreshMachineStatesFromSimulator() {
-    for(auto machine_id : machines) {
+    for(const auto machine_id : machines) {
         const MachineInfo_t info = Machine_GetInfo(machine_id);
         auto &view = machine_views[machine_id];
-        view.s_state = info.s_state;
+        view.s_state             = info.s_state;
         view.tracked_memory_used = info.memory_used;
-        view.active_task_count = info.active_tasks;
+        view.active_task_count   = info.active_tasks;
     }
 }
 
-/*
-* Helper method to convert from SLA type to a priority level. 
-*/
+// ---------------------------------------------------------------------------
+// PriorityFromSLA / MaxLoadForSLA
+// ---------------------------------------------------------------------------
 Priority_t Scheduler::PriorityFromSLA(SLAType_t sla) const {
     switch(sla) {
-        case SLA0:
-            return HIGH_PRIORITY;
-        case SLA1:
-            return MID_PRIORITY;
-        case SLA2:
-            return LOW_PRIORITY;
+        case SLA0:  return HIGH_PRIORITY;
+        case SLA1:  return MID_PRIORITY;
+        case SLA2:  return LOW_PRIORITY;
         case SLA3:
-        default:
-            return LOW_PRIORITY;
+        default:    return LOW_PRIORITY;
     }
 }
 
-
-/*
-* Helper method to calculate additional memory needed for task placement if new VM.
-*/
-unsigned Scheduler::AdditionalPlacementMemory(TaskId_t task_id, bool creating_vm) const {
-    unsigned extra = GetTaskMemory(task_id);
-    if(creating_vm) {
-        extra += VM_MEMORY_OVERHEAD;
+// Maximum tasks-per-core ratio allowed for each SLA tier.
+// SLA0 tasks must never share a core; SLA3 can be heavily oversubscribed.
+double Scheduler::MaxLoadForSLA(SLAType_t sla) const {
+    switch(sla) {
+        case SLA0:  return kLoadCapSLA0;
+        case SLA1:  return kLoadCapSLA1;
+        case SLA2:  return kLoadCapSLA2;
+        case SLA3:
+        default:    return kLoadCapSLA3;
     }
+}
+
+// ---------------------------------------------------------------------------
+// AdditionalPlacementMemory
+// How much tracked_memory_used will increase if we place this task, counting
+// VM_MEMORY_OVERHEAD only when we need to create a new VM.
+// ---------------------------------------------------------------------------
+unsigned Scheduler::AdditionalPlacementMemory(TaskId_t task_id, bool creating_vm) const {
+    const auto it = task_states.find(task_id);
+    if(it == task_states.end()) return 0;
+    unsigned extra = it->second.required_memory;
+    if(creating_vm) extra += VM_MEMORY_OVERHEAD;
     return extra;
 }
 
-/* Logic for if a machine can accommodate a task */
-bool Scheduler::IsMachineFeasible(TaskId_t task_id, MachineId_t machine_id, bool creating_vm) const {
-    const auto machine_it = machine_views.find(machine_id);
-    if(machine_it == machine_views.end()) {
-        return false;
-    }
-
+// ---------------------------------------------------------------------------
+// IsHardwareCompatible
+// Returns true if at least one machine in the cluster has the right CPU type
+// and GPU capability for this task, regardless of current load or memory.
+// Used only to detect tasks that can never run anywhere — the only valid
+// reason to permanently drop a task.
+// ---------------------------------------------------------------------------
+bool Scheduler::IsHardwareCompatible(TaskId_t task_id) const {
     const auto task_it = task_states.find(task_id);
-    if(task_it == task_states.end()) {
-        return false;
-    }
-
-    const MachineStateView &machine = machine_it->second;
+    if(task_it == task_states.end()) return false;
     const TaskState &task = task_it->second;
 
-    if(machine.s_state != S0) {
-        return false;
+    for(const auto machine_id : machines) {
+        const auto &machine = machine_views.at(machine_id);
+        if(machine.cpu != task.required_cpu) continue;
+        if(task.gpu_capable && !machine.gpu_enabled) continue;
+        return true;
     }
-
-    if(machine.cpu != task.required_cpu) {
-        return false;
-    }
-
-    if(machine.memory_capacity == 0) {
-        return false;
-    }
-
-    const unsigned projected_used = machine.tracked_memory_used + AdditionalPlacementMemory(task_id, creating_vm);
-    const double projected_utilization = static_cast<double>(projected_used) / static_cast<double>(machine.memory_capacity);
-    return projected_utilization < kCapacityCap;
+    return false;
 }
 
-bool Scheduler::HasReusableVM(MachineId_t machine_id, VMType_t required_vm, CPUType_t required_cpu, VMId_t &vm_id) const {
-    vm_id = VMId_t(-1);
-    for(const auto &kv : vm_states) {
-        const VMState &vm_state = kv.second;
-        if(vm_state.machine_id == machine_id && vm_state.cpu == required_cpu && vm_state.vm_type == required_vm && !vm_state.migrating) {
-            vm_id = kv.first;
+// ---------------------------------------------------------------------------
+// IsMachineFeasible
+// A machine is feasible for a task if:
+//   1. It has reached S0 and is not mid-transition.
+//   2. Its CPU type matches.
+//   3. It has GPU capability if the task requires it.
+//   4. Projected memory usage fits within the physical capacity.
+//   5. Projected load (tasks/cores) is within the SLA-appropriate cap.
+//
+// Memory cap is intentionally raw (no percentage headroom): the load cap is
+// the binding constraint for SLA compliance.
+// ---------------------------------------------------------------------------
+bool Scheduler::IsMachineFeasible(TaskId_t task_id, MachineId_t machine_id,
+                                   bool creating_vm) const {
+    const auto machine_it = machine_views.find(machine_id);
+    if(machine_it == machine_views.end()) return false;
+    const auto task_it = task_states.find(task_id);
+    if(task_it == task_states.end()) return false;
+
+    const MachineStateView &machine = machine_it->second;
+    const TaskState        &task    = task_it->second;
+
+    if(machine.s_state != S0)              return false;
+    if(machine.state_change_pending)       return false;
+    if(machine.cpu != task.required_cpu)   return false;
+    if(task.gpu_capable && !machine.gpu_enabled) return false;
+    if(machine.memory_capacity == 0)       return false;
+
+    // Memory: projected usage must not exceed physical capacity.
+    const unsigned projected_mem = machine.tracked_memory_used
+                                 + AdditionalPlacementMemory(task_id, creating_vm);
+    if(projected_mem >= machine.memory_capacity) return false;
+
+    // Load: tasks-per-core must stay below SLA-appropriate ceiling.
+    if(machine.num_cores == 0) return false;
+    const double projected_load = static_cast<double>(machine.active_task_count + 1)
+                                / static_cast<double>(machine.num_cores);
+    return projected_load <= MaxLoadForSLA(task.required_sla);
+}
+
+// ---------------------------------------------------------------------------
+// HasReusableVM
+// Looks up the per-machine VM index for a VM matching vm_type and cpu.
+// O(small constant) since each machine has at most a handful of VMs.
+// ---------------------------------------------------------------------------
+bool Scheduler::HasReusableVM(MachineId_t machine_id, VMType_t vm_type,
+                               CPUType_t cpu, VMId_t &out_vm_id) const {
+    out_vm_id = VMId_t(-1);
+    const auto it = machine_to_vms.find(machine_id);
+    if(it == machine_to_vms.end()) return false;
+
+    for(const VMId_t id : it->second) {
+        const auto vm_it = vm_states.find(id);
+        if(vm_it == vm_states.end()) continue;
+        const VMState &vm = vm_it->second;
+        if(vm.vm_type == vm_type && vm.cpu == cpu) {
+            out_vm_id = id;
             return true;
         }
     }
     return false;
 }
 
-/*
-* Mark task as at risk if only has 20% or less of its window before SLA violation.
-*/
-bool Scheduler::IsTaskAtRisk(TaskId_t task_id, Time_t now) const {
-    const auto task_it = task_states.find(task_id);
-    if(task_it == task_states.end()) {
-        return false;
-    }
-
-    const TaskState &state = task_it->second;
-    if(state.completed || !state.assigned || state.required_sla == SLA3) {
-        return false;
-    }
-
-    const TaskInfo_t info = GetTaskInfo(task_id);
-    if(info.completed || info.target_completion <= info.arrival) {
-        return false;
-    }
-
-    if(now >= info.target_completion) {
-        return true;
-    }
-
-    const uint64_t window = info.target_completion - info.arrival;
-    const uint64_t remaining = info.target_completion - now;
-    return (remaining * 100ULL) <= (window * 20ULL);
-}
-
-void Scheduler::RefreshProtectedMachines(Time_t now) {
-    protected_machines.clear();
-
-    for(const auto &kv : task_states) {
-        const TaskId_t task_id = kv.first;
-        const TaskState &state = kv.second;
-        if(!state.assigned || state.completed) {
-            continue;
-        }
-
-        if(!IsTaskAtRisk(task_id, now)) {
-            continue;
-        }
-
-        const auto vm_it = vm_states.find(state.assigned_vm);
-        if(vm_it == vm_states.end()) {
-            continue;
-        }
-
-        protected_machines.insert(vm_it->second.machine_id);
-        at_risk_tasks_detected++;
-    }
-}
-
-bool Scheduler::FindBestMigrationTarget(VMId_t vm_id, MachineId_t &target_machine_id) const {
-    const auto vm_it = vm_states.find(vm_id);
-    if(vm_it == vm_states.end()) {
-        return false;
-    }
-
-    const VMState &vm_state = vm_it->second;
-    const auto source_machine_it = machine_views.find(vm_state.machine_id);
-    if(source_machine_it == machine_views.end()) {
-        return false;
-    }
-
-    const unsigned migration_footprint = vm_state.tracked_memory_footprint;
-    if(migration_footprint == 0) {
-        return false;
-    }
-
-    double best_utilization = std::numeric_limits<double>::max();
-    bool found = false;
-    MachineId_t best_machine = vm_state.machine_id;
-
-    for(const auto machine_id : machines) {
-        if(machine_id == vm_state.machine_id) {
-            continue;
-        }
-
-        const auto machine_it = machine_views.find(machine_id);
-        if(machine_it == machine_views.end()) {
-            continue;
-        }
-
-        const MachineStateView &machine = machine_it->second;
-        if(machine.s_state != S0 || machine.cpu != vm_state.cpu || machine.memory_capacity == 0) {
-            continue;
-        }
-
-        const unsigned projected_used = machine.tracked_memory_used + migration_footprint;
-        const double projected_utilization = static_cast<double>(projected_used) / static_cast<double>(machine.memory_capacity);
-        if(projected_utilization >= kCapacityCap || projected_utilization > kMigrationTargetMaxUtilization) {
-            continue;
-        }
-
-        // Prefer targets that are not currently protected to avoid shifting pressure onto hot hosts.
-        const bool target_protected = (protected_machines.find(machine_id) != protected_machines.end());
-        const bool best_protected = found ? (protected_machines.find(best_machine) != protected_machines.end()) : true;
-        if(found && target_protected != best_protected) {
-            if(target_protected) {
-                continue;
-            }
-        }
-
-        if(!found || projected_utilization < best_utilization || (projected_utilization == best_utilization && machine_id < best_machine)) {
-            found = true;
-            best_utilization = projected_utilization;
-            best_machine = machine_id;
-        }
-    }
-
-    if(!found) {
-        return false;
-    }
-
-    target_machine_id = best_machine;
-    return true;
-}
-
-bool Scheduler::TryMigrateAtRiskTask(TaskId_t task_id, Time_t now, bool allow_wake) {
-    auto task_it = task_states.find(task_id);
-    if(task_it == task_states.end()) {
-        return false;
-    }
-
-    TaskState &task = task_it->second;
-    if(task.completed || !task.assigned || task.required_sla != SLA0) {
-        return false;
-    }
-
-    if(!IsTaskAtRisk(task_id, now)) {
-        return false;
-    }
-
-    const TaskInfo_t info = GetTaskInfo(task_id);
-    const uint64_t window = (info.target_completion > info.arrival) ? (info.target_completion - info.arrival) : 0;
-    if(window == 0) {
-        return false;
-    }
-
-    const uint64_t remaining = (info.target_completion > now) ? (info.target_completion - now) : 0;
-    if((remaining * 100ULL) > (window * static_cast<uint64_t>(kMigrationUrgencyRemainingRatio * 100.0))) {
-        return false;
-    }
-
-    auto vm_it = vm_states.find(task.assigned_vm);
-    if(vm_it == vm_states.end()) {
-        return false;
-    }
-
-    VMState &vm_state = vm_it->second;
-    if(vm_state.migrating) {
-        return false;
-    }
-
-    const auto cooldown_it = vm_last_migration_time.find(vm_state.vm_id);
-    if(cooldown_it != vm_last_migration_time.end() && now < cooldown_it->second + kMigrationCooldown) {
-        return false;
-    }
-
-    MachineId_t target_machine_id = vm_state.machine_id;
-    if(FindBestMigrationTarget(vm_state.vm_id, target_machine_id)) {
-        VM_Migrate(vm_state.vm_id, target_machine_id);
-        vm_state.migrating = true;
-        vm_last_migration_time[vm_state.vm_id] = now;
-        migrations++;
-        return true;
-    }
-
-    if(!allow_wake) {
-        return false;
-    }
-
-    // If no active target exists, wake a compatible standby machine to absorb imminent SLA pressure.
-    for(const auto machine_id : machines) {
-        auto machine_it = machine_views.find(machine_id);
-        if(machine_it == machine_views.end()) {
-            continue;
-        }
-
-        MachineStateView &machine = machine_it->second;
-        if(machine.cpu != vm_state.cpu || machine.s_state == S0) {
-            continue;
-        }
-
-        Machine_SetState(machine_id, S0);
-        machine.state_change_pending = true;
-        wakeups++;
-        return true;
-    }
-
-    return false;
-}
-
-void Scheduler::ProcessAtRiskMigrations(Time_t now) {
-    unsigned migrations_this_tick = 0;
-    for(const auto &kv : task_states) {
-        if(migrations_this_tick >= kMaxMigrationsPerTick) {
-            break;
-        }
-
-        const TaskId_t task_id = kv.first;
-        if(TryMigrateAtRiskTask(task_id, now, true)) {
-            migrations_this_tick++;
-        }
-    }
-}
-
+// ---------------------------------------------------------------------------
+// TryPlaceTask
+//
+// Placement direction is SLA-aware:
+//   SLA0/SLA1 → iterate fast→slow (sorted_machines forward)
+//               Ensures tight-SLA tasks land on the fastest available machine.
+//   SLA2/SLA3 → iterate slow→fast (sorted_machines backward)
+//               Passively reserves fast machines for high-priority work.
+//
+// Within each direction we take the first feasible machine (no score search)
+// because the ordering itself encodes the preference.
+//
+// If no machine is feasible and IsHardwareCompatible returns false, the task
+// is permanently dropped.  Otherwise the caller should enqueue it for retry.
+//
+// Shadow state is updated synchronously on placement so subsequent calls
+// within the same burst see accurate occupancy data.
+// ---------------------------------------------------------------------------
 bool Scheduler::TryPlaceTask(TaskId_t task_id) {
     const auto task_it = task_states.find(task_id);
-    if(task_it == task_states.end()) {
-        return false;
-    }
+    if(task_it == task_states.end()) return false;
 
-    if(task_it->second.placement_failed || task_it->second.assigned || task_it->second.completed) {
-        return false;
-    }
+    TaskState &task = task_it->second;
+    if(task.placement_failed || task.assigned || task.completed) return false;
 
-    const CPUType_t required_cpu = task_it->second.required_cpu;
-    const VMType_t required_vm = task_it->second.required_vm;
-    const Priority_t priority = task_it->second.assigned_priority;
+    const CPUType_t  required_cpu = task.required_cpu;
+    const VMType_t   required_vm  = task.required_vm;
+    const Priority_t priority     = task.assigned_priority;
+    const SLAType_t  required_sla = task.required_sla;
 
-    // More frequent refresh keeps placement decisions aligned with simulator-side changes.
-    RefreshMachineStatesFromSimulator();
+    // SLA0/1 prefer fast machines; SLA2/3 prefer slow machines to leave
+    // fast machines free for time-sensitive work.
+    const bool prefer_fast = (required_sla == SLA0 || required_sla == SLA1);
+    const int  n           = static_cast<int>(sorted_machines.size());
 
-    bool skipped_any_protected_machine = false;
-    auto try_pass = [&](bool allow_protected_hosts) -> bool {
-        for(const auto machine_id : machines) {
-            if(!allow_protected_hosts && protected_machines.find(machine_id) != protected_machines.end()) {
-                skipped_any_protected_machine = true;
-                protected_machine_skips++;
-                continue;
-            }
+    for(int idx = 0; idx < n; idx++) {
+        const int         i          = prefer_fast ? idx : (n - 1 - idx);
+        const MachineId_t machine_id = sorted_machines[i];
 
-        VMId_t vm_id = VMId_t(-1);
-        const bool has_reusable_vm = HasReusableVM(machine_id, required_vm, required_cpu, vm_id);
-        const bool creating_vm = !has_reusable_vm;
+        VMId_t     vm_id       = VMId_t(-1);
+        const bool has_reuse   = HasReusableVM(machine_id, required_vm, required_cpu, vm_id);
+        const bool creating_vm = !has_reuse;
 
-        if(!IsMachineFeasible(task_id, machine_id, creating_vm)) {
-            continue;
-        }
+        if(!IsMachineFeasible(task_id, machine_id, creating_vm)) continue;
 
-        if(!has_reusable_vm) {
+        // -- Create VM if needed ------------------------------------------
+        if(creating_vm) {
             vm_id = VM_Create(required_vm, required_cpu);
             VM_Attach(vm_id, machine_id);
-            vm_states[vm_id] = VMState{vm_id, machine_id, required_vm, required_cpu, false, {}, VM_MEMORY_OVERHEAD};
-            machine_views[machine_id].active_vms.insert(vm_id);
+            vm_states[vm_id] = VMState{
+                vm_id, machine_id, required_vm, required_cpu,
+                VM_MEMORY_OVERHEAD
+            };
+            machine_to_vms[machine_id].push_back(vm_id);
             machine_views[machine_id].tracked_memory_used += VM_MEMORY_OVERHEAD;
             vms_created++;
         }
 
+        // -- Assign task to VM --------------------------------------------
         VM_AddTask(vm_id, task_id, priority);
-        task_to_vm[task_id] = vm_id;
-        vm_states[vm_id].active_tasks.insert(task_id);
-        vm_states[vm_id].tracked_memory_footprint += task_it->second.required_memory;
-        machine_views[machine_id].tracked_memory_used += task_it->second.required_memory;
+        vm_states[vm_id].tracked_memory_footprint += task.required_memory;
+        machine_views[machine_id].tracked_memory_used += task.required_memory;
         machine_views[machine_id].active_task_count++;
-        task_it->second.assigned = true;
-        task_it->second.assigned_vm = vm_id;
+        task.assigned    = true;
+        task.assigned_vm = vm_id;
         successful_placements++;
-            return true;
-        }
-        return false;
-    };
-
-    if(try_pass(false)) {
         return true;
     }
 
-    // If all candidates were protected, allow only top-priority classes to spill over.
-    if(skipped_any_protected_machine && priority == HIGH_PRIORITY) {
-        if(try_pass(true)) {
-            return true;
-        }
+    // No machine was feasible.  Permanently drop only if no machine could
+    // ever host this task regardless of load.
+    if(!IsHardwareCompatible(task_id)) {
+        task.placement_failed = true;
+        failed_task_ids.push_back(task_id);
+        placement_failures++;
+        SimOutput("TryPlaceTask(): task " + to_string(task_id)
+                  + " has no compatible hardware — dropped", 0);
     }
-
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// EnqueueRetry / ProcessRetryQueue
+// ---------------------------------------------------------------------------
 void Scheduler::EnqueueRetry(TaskId_t task_id) {
     retry_queue.push_back({task_id});
     retry_enqueues++;
 }
 
+// Processes up to kRetryBatchCap entries from the front of the retry queue.
+// Tasks that succeed or are hardware-incompatible are removed permanently.
+// All others are re-appended — they stay in the queue until a machine frees
+// up.
 void Scheduler::ProcessRetryQueue(Time_t now) {
-    const size_t queue_snapshot_size = retry_queue.size();
-    for(size_t i = 0; i < queue_snapshot_size; i++) {
+    const size_t batch = min(retry_queue.size(), static_cast<size_t>(kRetryBatchCap));
+
+    for(size_t i = 0; i < batch; i++) {
         const RetryEntry entry = retry_queue.front();
         retry_queue.pop_front();
 
-        auto task_it = task_states.find(entry.task_id);
-        if(task_it == task_states.end()) {
-            continue;
-        }
+        const auto task_it = task_states.find(entry.task_id);
+        if(task_it == task_states.end()) continue;
 
-        if(task_it->second.placement_failed || task_it->second.assigned) {
-            continue;
-        }
+        const TaskState &task = task_it->second;
+        if(task.placement_failed || task.completed || task.assigned) continue;
 
         retry_attempts++;
-        if(TryPlaceTask(entry.task_id)) {
-            continue;
-        }
 
+        if(TryPlaceTask(entry.task_id)) continue;
+
+        // TryPlaceTask may have just set placement_failed (hardware-incompatible).
+        if(task_it->second.placement_failed) continue;
+
+        // Capacity-constrained — re-enqueue.
         task_it->second.retry_count++;
-        if(task_it->second.retry_count == kMaxRetriesPerTask) {
-            SimOutput("Scheduler::ProcessRetryQueue(): task " + to_string(entry.task_id) + " reached retry threshold at time " + to_string(now) + ", continuing retries", 2);
+        if(task_it->second.retry_count == 50) {
+            SimOutput("ProcessRetryQueue(): task " + to_string(entry.task_id)
+                      + " has missed 50 placements at time " + to_string(now)
+                      + " — still retrying", 1);
         }
         retry_queue.push_back(entry);
     }
 }
 
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
 void Scheduler::Init() {
-    // Find the parameters of the clusters
-    // Get the total number of machines
-    // For each machine:
-    //      Get the type of the machine
-    //      Get the memory of the machine
-    //      Get the number of CPUs
-    //      Get if there is a GPU or not
-    // 
-    const unsigned total_machines = Machine_GetTotal();
-    SimOutput("Scheduler::Init(): Total number of machines is " + to_string(total_machines), 3);
-    SimOutput("Scheduler::Init(): Initializing scheduler", 1);
+    const unsigned total = Machine_GetTotal();
+    SimOutput("Scheduler::Init(): Total machines = " + to_string(total), 3);
+    SimOutput("Scheduler::Init(): Initializing", 1);
 
-    //RESET SCHEDULER STATES
+    // Reset all state.
     task_states.clear();
     vm_states.clear();
-    task_to_vm.clear();
-    vm_last_migration_time.clear();
+    machine_to_vms.clear();
+    machine_views.clear();
+    machines.clear();
+    sorted_machines.clear();
     retry_queue.clear();
     failed_task_ids.clear();
 
-    //RESET SCHEDULER REPORTING COUNTERS
-    tasks_seen = 0;
-    tasks_completed = 0;
+    tasks_seen            = 0;
+    tasks_completed       = 0;
     successful_placements = 0;
-    retry_enqueues = 0;
-    retry_attempts = 0;
-    placement_failures = 0;
-    vms_created = 0;
-    migrations = 0;
-    wakeups = 0;
-    at_risk_tasks_detected = 0;
-    protected_machine_skips = 0;
+    retry_enqueues        = 0;
+    retry_attempts        = 0;
+    placement_failures    = 0;
+    vms_created           = 0;
 
     InitializeMachineViews();
-    RefreshMachineStatesFromSimulator();
 
-    SimOutput("Scheduler::Init(): machine state scaffolding initialized", 2);
-}
-
-void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
-    // Update your data structure. The VM now can receive new tasks
-    (void)time;
-    auto vm_it = vm_states.find(vm_id);
-    if(vm_it != vm_states.end()) {
-        vm_it->second.migrating = false;
-        const VMInfo_t vm_info = VM_GetInfo(vm_id);
-        vm_it->second.machine_id = vm_info.machine_id;
+    // Wake every machine immediately.  Energy is not a concern for this
+    // configuration — all capacity must be available before tasks arrive.
+    for(const auto machine_id : machines) {
+        auto &view = machine_views[machine_id];
+        if(view.s_state != S0) {
+            Machine_SetState(machine_id, S0);
+            view.state_change_pending = true;
+        }
     }
 
-    RefreshMachineStatesFromSimulator();
+    SimOutput("Scheduler::Init(): all machines issued S0 wake command", 2);
 }
 
+// ---------------------------------------------------------------------------
+// HandleMachineWake
+// Called by StateChangeComplete whenever a machine finishes transitioning.
+// Clears state_change_pending and drains the retry queue so tasks waiting on
+// this machine are placed immediately.
+// ---------------------------------------------------------------------------
+void Scheduler::HandleMachineWake(Time_t time, MachineId_t machine_id) {
+    auto machine_it = machine_views.find(machine_id);
+    if(machine_it == machine_views.end()) return;
+
+    MachineStateView &machine = machine_it->second;
+    machine.state_change_pending = false;
+
+    const MachineInfo_t info = Machine_GetInfo(machine_id);
+    machine.s_state             = info.s_state;
+    machine.tracked_memory_used = info.memory_used;
+    machine.active_task_count   = info.active_tasks;
+
+    if(info.s_state != S0) {
+        SimOutput("Scheduler::HandleMachineWake(): machine "
+                  + to_string(machine_id) + " did not reach S0", 2);
+        return;
+    }
+
+    SimOutput("Scheduler::HandleMachineWake(): machine "
+              + to_string(machine_id) + " is S0 at time "
+              + to_string(time) + " — draining retry queue", 2);
+    ProcessRetryQueue(time);
+}
+
+// ---------------------------------------------------------------------------
+// MigrationComplete
+// Migration is not initiated by this scheduler.  The callback is implemented
+// to satisfy the interface in case the simulator invokes it anyway.
+// ---------------------------------------------------------------------------
+void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
+    (void)time;
+    (void)vm_id;
+}
+
+// ---------------------------------------------------------------------------
+// NewTask
+// Registers task state and attempts immediate placement.
+// NO RefreshMachineStatesFromSimulator here — shadow state accumulated by
+// previous placements must not be overwritten by stale simulator data during
+// a burst (tasks arriving 1000 time units apart cannot propagate to the
+// simulator between arrivals).
+// ---------------------------------------------------------------------------
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
-    // Get the task parameters
-    //  IsGPUCapable(task_id);
-    //  GetMemory(task_id);
-    //  RequiredVMType(task_id);
-    //  RequiredSLA(task_id);
-    //  RequiredCPUType(task_id);
-    // Decide to attach the task to an existing VM, 
-    //      vm.AddTask(taskid, Priority_T priority); or
-    // Create a new VM, attach the VM to a machine
-    //      VM vm(type of the VM)
-    //      vm.Attach(machine_id);
-    //      vm.AddTask(taskid, Priority_t priority) or
-    // Turn on a machine, create a new VM, attach it to the VM, then add the task
-    //
-    // Turn on a machine, migrate an existing VM from a loaded machine....
-    //
-    // Other possibilities as desired
     (void)now;
 
-    // Temporary safe behavior before phase-3+ policy logic:
-    // lazily create a compatible VM on the first S0 machine with matching CPU.
-    const CPUType_t required_cpu = RequiredCPUType(task_id);
-    const VMType_t required_vm = RequiredVMType(task_id);
-    const SLAType_t required_sla = RequiredSLA(task_id);
-    const Priority_t priority = PriorityFromSLA(required_sla);
+    const CPUType_t  required_cpu = RequiredCPUType(task_id);
+    const VMType_t   required_vm  = RequiredVMType(task_id);
+    const SLAType_t  required_sla = RequiredSLA(task_id);
+    const Priority_t priority     = PriorityFromSLA(required_sla);
 
-    // Keep simulator task metadata aligned with scheduler-assigned priority.
     SetTaskPriority(task_id, priority);
 
     task_states[task_id] = TaskState{
@@ -518,146 +416,138 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
         GetTaskMemory(task_id),
         IsTaskGPUCapable(task_id),
         priority,
-        false,
-        false,
+        false,       // assigned
+        false,       // completed
         VMId_t(-1),
-        0,
-        false
+        0,           // retry_count
+        false        // placement_failed
     };
 
     tasks_seen++;
-
-    RefreshMachineStatesFromSimulator();
-    RefreshProtectedMachines(now);
 
     if(!TryPlaceTask(task_id)) {
         EnqueueRetry(task_id);
     }
 }
 
+// ---------------------------------------------------------------------------
+// PeriodicCheck
+// The only place that syncs shadow state from the simulator.  All placement
+// work is driven from here between bursts.
+// ---------------------------------------------------------------------------
 void Scheduler::PeriodicCheck(Time_t now) {
-    // This method should be called from SchedulerCheck()
-    // SchedulerCheck is called periodically by the simulator to allow you to monitor, make decisions, adjustments, etc.
-    // Unlike the other invocations of the scheduler, this one doesn't report any specific event
-    // Recommendation: Take advantage of this function to do some monitoring and adjustments as necessary
-    // MVP phase 8: Refresh dynamic machine state before processing retries to reduce stale-state effects.
     RefreshMachineStatesFromSimulator();
-    RefreshProtectedMachines(now);
     ProcessRetryQueue(now);
 }
 
+// ---------------------------------------------------------------------------
+// SLAWarn
+// An SLA warning fires when a task is approaching its deadline.  With the
+// load-cap placement strategy there is no migration to trigger; we use the
+// warning only to attempt immediate placement of any queued tasks.
+// ---------------------------------------------------------------------------
 void Scheduler::SLAWarn(Time_t now, TaskId_t task_id) {
-    RefreshMachineStatesFromSimulator();
-    RefreshProtectedMachines(now);
     (void)task_id;
-    (void)now;
+    ProcessRetryQueue(now);
 }
 
+// ---------------------------------------------------------------------------
+// Shutdown
+// ---------------------------------------------------------------------------
 void Scheduler::Shutdown(Time_t time) {
-    // Do your final reporting and bookkeeping here.
-    // Report about the total energy consumed
-    // Report about the SLA compliance
-    // Shutdown everything to be tidy :-)
     cout << "Scheduler report" << endl;
-    cout << "Tasks seen: " << tasks_seen << endl;
-    cout << "Tasks completed: " << tasks_completed << endl;
+    cout << "Tasks seen:            " << tasks_seen            << endl;
+    cout << "Tasks completed:       " << tasks_completed       << endl;
     cout << "Successful placements: " << successful_placements << endl;
-    cout << "Retry enqueues: " << retry_enqueues << endl;
-    cout << "Retry attempts: " << retry_attempts << endl;
-    cout << "Placement failures: " << placement_failures << endl;
-    cout << "VMs created: " << vms_created << endl;
-    cout << "Migrations: " << migrations << endl;
-    cout << "Wakeups: " << wakeups << endl;
-    cout << "At-risk tasks detected: " << at_risk_tasks_detected << endl;
-    cout << "Protected-machine skips: " << protected_machine_skips << endl;
+    cout << "Retry enqueues:        " << retry_enqueues        << endl;
+    cout << "Retry attempts:        " << retry_attempts        << endl;
+    cout << "Placement failures:    " << placement_failures    << endl;
+    cout << "VMs created:           " << vms_created           << endl;
     cout << "Failed task IDs: ";
     if(failed_task_ids.empty()) {
         cout << "none";
     } else {
         for(size_t i = 0; i < failed_task_ids.size(); i++) {
-            if(i > 0) {
-                cout << ",";
-            }
+            if(i > 0) cout << ",";
             cout << failed_task_ids[i];
         }
     }
+    unsigned long long total_retry_misses = 0;
+    for(const auto &kv : task_states) {
+        total_retry_misses += kv.second.retry_count;
+    }
+    cout << "Total retry misses:    " << total_retry_misses << endl;
     cout << endl;
 
-    for(auto & vm_entry: vm_states) {
-        VM_Shutdown(vm_entry.first);
+    for(auto &kv : vm_states) {
+        VM_Shutdown(kv.first);
     }
-    SimOutput("SimulationComplete(): Finished!", 4);
-    SimOutput("SimulationComplete(): Time is " + to_string(time), 4);
+    SimOutput("SimulationComplete(): Finished at time " + to_string(time), 4);
 }
 
+// ---------------------------------------------------------------------------
+// TaskComplete
+// Updates shadow state synchronously — no simulator refresh, which would
+// overwrite the decrements before the simulator commits the next placement.
+// After updating shadow state, immediately attempts to place any queued tasks
+// that were waiting for this capacity.
+// ---------------------------------------------------------------------------
 void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
-    // Do any bookkeeping necessary for the data structures
-    // Decide if a machine is to be turned off, slowed down, or VMs to be migrated according to your policy
-    // This is an opportunity to make any adjustments to optimize performance/energy
-    SimOutput("Scheduler::TaskComplete(): Task " + to_string(task_id) + " is complete at " + to_string(now), 4);
+    SimOutput("Scheduler::TaskComplete(): task " + to_string(task_id)
+              + " complete at " + to_string(now), 4);
 
-    RefreshMachineStatesFromSimulator();
+    const auto task_it = task_states.find(task_id);
+    if(task_it == task_states.end()) return;
+    if(task_it->second.completed) return;
 
-    auto task_it = task_states.find(task_id);
-    if(task_it == task_states.end()) {
-        return;
-    }
-
-    if(task_it->second.completed) {
-        return;
-    }
-
-    task_it->second.completed = true;
+    TaskState &task = task_it->second;
+    task.completed = true;
     tasks_completed++;
 
-    if(!task_it->second.assigned) {
-        return;
-    }
+    if(!task.assigned) return;
 
-    const VMId_t vm_id = task_it->second.assigned_vm;
-    auto vm_it = vm_states.find(vm_id);
+    const VMId_t vm_id = task.assigned_vm;
+    const auto vm_it = vm_states.find(vm_id);
     if(vm_it == vm_states.end()) {
-        task_it->second.assigned = false;
-        task_it->second.assigned_vm = VMId_t(-1);
-        task_to_vm.erase(task_id);
+        task.assigned    = false;
+        task.assigned_vm = VMId_t(-1);
         return;
     }
 
-    VMState &vm_state = vm_it->second;
-    vm_state.active_tasks.erase(task_id);
-    if(vm_state.tracked_memory_footprint >= task_it->second.required_memory) {
-        vm_state.tracked_memory_footprint -= task_it->second.required_memory;
+    VMState &vm = vm_it->second;
+
+    // Decrement VM memory footprint.
+    if(vm.tracked_memory_footprint >= task.required_memory) {
+        vm.tracked_memory_footprint -= task.required_memory;
     } else {
-        vm_state.tracked_memory_footprint = 0;
+        vm.tracked_memory_footprint = 0;
     }
 
-    auto machine_it = machine_views.find(vm_state.machine_id);
+    // Decrement machine shadow state.
+    const auto machine_it = machine_views.find(vm.machine_id);
     if(machine_it != machine_views.end()) {
         MachineStateView &machine = machine_it->second;
-        if(machine.active_task_count > 0) {
-            machine.active_task_count--;
-        }
-        if(machine.tracked_memory_used >= task_it->second.required_memory) {
-            machine.tracked_memory_used -= task_it->second.required_memory;
+        if(machine.active_task_count > 0) machine.active_task_count--;
+        if(machine.tracked_memory_used >= task.required_memory) {
+            machine.tracked_memory_used -= task.required_memory;
         } else {
             machine.tracked_memory_used = 0;
         }
     }
 
-    task_to_vm.erase(task_id);
-    task_it->second.assigned = false;
-    task_it->second.assigned_vm = VMId_t(-1);
+    task.assigned    = false;
+    task.assigned_vm = VMId_t(-1);
 
-    // MVP phase 7: Keep empty VMs alive for future reuse rather than shutdown.
-    // Future post-MVP phases will implement consolidation/shutdown policy.
-    // (VM reuse reduces VM creation churn during burst recovery.)
-
-    RefreshMachineStatesFromSimulator();
-    RefreshProtectedMachines(now);
+    // Immediately attempt to place tasks that were waiting for this capacity.
+    if(!retry_queue.empty()) {
+        ProcessRetryQueue(now);
+    }
 }
 
 
-// Public interface below
+// ---------------------------------------------------------------------------
+// Public interface — thin wrappers
+// ---------------------------------------------------------------------------
 
 static Scheduler Scheduler;
 
@@ -667,42 +557,41 @@ void InitScheduler() {
 }
 
 void HandleNewTask(Time_t time, TaskId_t task_id) {
-    SimOutput("HandleNewTask(): Received new task " + to_string(task_id) + " at time " + to_string(time), 4);
+    SimOutput("HandleNewTask(): task " + to_string(task_id)
+              + " at time " + to_string(time), 4);
     Scheduler.NewTask(time, task_id);
 }
 
 void HandleTaskCompletion(Time_t time, TaskId_t task_id) {
-    SimOutput("HandleTaskCompletion(): Task " + to_string(task_id) + " completed at time " + to_string(time), 4);
+    SimOutput("HandleTaskCompletion(): task " + to_string(task_id)
+              + " at time " + to_string(time), 4);
     Scheduler.TaskComplete(time, task_id);
 }
 
 void MemoryWarning(Time_t time, MachineId_t machine_id) {
-    // The simulator is alerting you that machine identified by machine_id is overcommitted
-    SimOutput("MemoryWarning(): Overflow at " + to_string(machine_id) + " was detected at time " + to_string(time), 0);
+    SimOutput("MemoryWarning(): machine " + to_string(machine_id)
+              + " at time " + to_string(time), 0);
 }
 
 void MigrationDone(Time_t time, VMId_t vm_id) {
-    // The function is called on to alert you that migration is complete
-    SimOutput("MigrationDone(): Migration of VM " + to_string(vm_id) + " was completed at time " + to_string(time), 4);
+    SimOutput("MigrationDone(): VM " + to_string(vm_id)
+              + " at time " + to_string(time), 4);
     Scheduler.MigrationComplete(time, vm_id);
 }
 
 void SchedulerCheck(Time_t time) {
-    // This function is called periodically by the simulator, no specific event
-    SimOutput("SchedulerCheck(): SchedulerCheck() called at " + to_string(time), 4);
+    SimOutput("SchedulerCheck(): at time " + to_string(time), 4);
     Scheduler.PeriodicCheck(time);
 }
 
 void SimulationComplete(Time_t time) {
-    // This function is called before the simulation terminates Add whatever you feel like.
     cout << "SLA violation report" << endl;
     cout << "SLA0: " << GetSLAReport(SLA0) << "%" << endl;
     cout << "SLA1: " << GetSLAReport(SLA1) << "%" << endl;
-    cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;     // SLA3 do not have SLA violation issues
+    cout << "SLA2: " << GetSLAReport(SLA2) << "%" << endl;
     cout << "Total Energy " << Machine_GetClusterEnergy() << "KW-Hour" << endl;
     cout << "Simulation run finished in " << double(time)/1000000 << " seconds" << endl;
-    SimOutput("SimulationComplete(): Simulation finished at time " + to_string(time), 4);
-    
+    SimOutput("SimulationComplete(): at time " + to_string(time), 4);
     Scheduler.Shutdown(time);
 }
 
@@ -711,6 +600,5 @@ void SLAWarning(Time_t time, TaskId_t task_id) {
 }
 
 void StateChangeComplete(Time_t time, MachineId_t machine_id) {
-    // Called in response to an earlier request to change the state of a machine
+    Scheduler.HandleMachineWake(time, machine_id);
 }
-
