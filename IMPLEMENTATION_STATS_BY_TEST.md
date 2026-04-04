@@ -5,6 +5,7 @@ This document tracks scheduler outcomes per test input across implementation ver
 Sources:
 - Historical runs: SLA_RUN_TRACKER.md (Run Groups A-H)
 - Latest run-v batch: tmp/run_logs/runv_batch_summary_clean_20260403_191632.tsv (Run Group I)
+- Latest run-v batch: tmp/run_logs/runv_suite_eeco_manual_20260404_015813.tsv (Run Group J, EECO)
 
 ## Run Labels
 
@@ -17,6 +18,7 @@ Sources:
 - G: Migration urgency <=10% (Spikey only)
 - H: Parallel batch, protection+headroom context
 - I: Current codebase run-v batch (2026-04-03), load-cap scheduler
+- J: Current codebase run-v batch (2026-04-04), EECO implementation
 
 ## Big_Small
 
@@ -24,18 +26,21 @@ Sources:
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | H | 88.8417% | 58.5366% | 0% | - | 0 | 0 | 3 | - | - | Previous implementation |
 | I | 0.0499251% | 0% | 0% | 0.029202 | 3841 | 3532384 | 24 | 0 | 3528543 | Current run-v result |
+| J | 0% | 20.7317% | 0% | 0.0295132 | 3889 | 3889 | 24 | 0 | 0 | EECO run |
 
 ## canvas.txt
 
 | Run | SLA0 | SLA1 | SLA2 | Energy (KW-Hour) | Retry Enqueues | Retry Attempts | VMs Created | Placement Failures | Total Retry Misses | Notes |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | I | 0% | 0% | 0% | 7.27281 | 0 | 0 | 27 | 0 | 0 | Current run-v result |
+| J | 0% | 0% | 0% | 4.6532 | 680 | 680 | 30 | 0 | 0 | EECO run |
 
 ## Day
 
 | Run | SLA0 | SLA1 | SLA2 | Energy (KW-Hour) | Retry Enqueues | Retry Attempts | VMs Created | Placement Failures | Total Retry Misses | Notes |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | I | 0% | 0% | 0% | 64.0121 | 0 | 0 | 2 | 0 | 0 | Current run-v result |
+| J | 0% | 0% | 0% | 48.1744 | 0 | 0 | 4 | 0 | 0 | EECO run |
 
 ## Gentler_Hour
 
@@ -47,6 +52,7 @@ Sources:
 | D | 57.7778% | 84.3436% | 5.471% | - | 6 | 33 | 15 | - | - | Migration v1 |
 | H | 13.6508% | 86.8586% | 5.59708% | - | 10 | 78 | 11 | - | - | Parallel batch |
 | I | 0% | 0% | 0% | 7.25414 | 0 | 0 | 23 | 0 | 0 | Current run-v result |
+| J | 0% | 0% | 0% | 4.61681 | 159 | 159 | 27 | 0 | 0 | EECO run |
 
 ## Input
 
@@ -54,6 +60,7 @@ Sources:
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | H | 0% | 0% | 14.0969% | - | 54 | 10964 | 14 | - | - | Previous implementation |
 | I | 0% | 0% | 0% | 0.0124647 | 53 | 15789 | 14 | 0 | 15736 | Current run-v result |
+| J | 0% | 0% | 0.440529% | 0.0124406 | 53 | 1435 | 16 | 0 | 1382 | EECO run |
 
 ## Match_Me_If_You_Can
 
@@ -65,6 +72,7 @@ Sources:
 | D | 92.012% | 58.5366% | 0% | - | 0 | 0 | 3 | - | - | Migration v1 |
 | H | 88.8417% | 58.5366% | 0% | - | 0 | 0 | 3 | - | - | Parallel batch |
 | I | 0% | 0% | 0% | 0.045626 | 1671 | 1001785 | 40 | 0 | 1000114 | Current run-v result |
+| J | 0% | 0% | 0% | 0.0457817 | 1964 | 1964 | 40 | 0 | 0 | EECO run |
 
 ## Nice_and_Smooth
 
@@ -72,6 +80,7 @@ Sources:
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | H | 0% | 0% | 0% | - | 0 | 0 | 1 | - | - | Previous implementation |
 | I | 0% | 0% | 0% | 0.0121098 | 0 | 0 | 1 | 0 | 0 | Current run-v result |
+| J | 0% | 0% | 0% | 0.0110282 | 0 | 0 | 1 | 0 | 0 | EECO run |
 
 ## Spikey_Mean
 
@@ -86,6 +95,7 @@ Sources:
 | G | 88.8417% | 58.5366% | 0% | - | 0 | 0 | 3 | 37 | - | - | Urgent migration only |
 | H | 88.8417% | 58.5366% | 0% | - | 0 | 0 | 3 | 0 | - | - | Parallel batch |
 | I | 0% | 0% | 0% | 0.0250182 | 3875 | 3626180 | 16 | 0 | 0 | 3622305 | Current run-v result |
+| J | 0% | 21.9512% | 0% | 0.0250182 | 3923 | 3923 | 16 | 0 | 0 | EECO run |
 
 ## SpikeyNefarious
 
@@ -93,6 +103,7 @@ Sources:
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
 | H | 52.5397% | 37.8049% | 0% | - | 0 | 0 | 2 | - | - | Previous implementation |
 | I | 0% | 0% | 0% | 0.0116119 | 0 | 0 | 16 | 0 | 0 | Current run-v result |
+| J | 0% | 0% | 0% | 0.0116119 | 0 | 0 | 16 | 0 | 0 | EECO run |
 
 ## Tall_Short
 
@@ -104,6 +115,7 @@ Sources:
 | D | 100% | 58.5366% | 0% | - | 0 | 0 | 3 | 69 | - | - | Migration v1 |
 | H | 100% | 58.5366% | 0% | - | 0 | 0 | 3 | 0 | - | - | Parallel batch |
 | I | 40.4393% | 0% | 0% | 0.0351485 | 3846 | 4714178 | 24 | 0 | 0 | 4710332 | Current run-v result |
+| J | 37.7683% | 41.4634% | 0% | 0.0353243 | 3894 | 3894 | 24 | 0 | 0 | EECO run |
 
 ## Run I Full End-of-Run Statistics
 
@@ -119,6 +131,34 @@ Sources:
 | Spikey_Mean | 0% | 0% | 0% | 0.0250182 | 28.02 | 4088 | 4088 | 4088 | 3875 | 3626180 | 0 | 16 | none | 3622305 |
 | SpikeyNefarious | 0% | 0% | 0% | 0.0116119 | 16.32 | 712 | 712 | 712 | 0 | 0 | 0 | 16 | none | 0 |
 | Tall_Short | 40.4393% | 0% | 0% | 0.0351485 | 34.56 | 4088 | 4088 | 4088 | 3846 | 4714178 | 0 | 24 | none | 4710332 |
+
+## Run J Full End-of-Run Statistics
+
+| Input | SLA0 | SLA1 | SLA2 | Energy (KW-Hour) | Sim Seconds | Tasks Seen | Tasks Completed | Successful Placements | Retry Enqueues | Retry Attempts | Placement Failures | VMs Created | Failed Task IDs | Total Retry Misses |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
+| Big_Small | 0% | 20.7317% | 0% | 0.0295132 | 30.24 | 4088 | 4088 | 4088 | 3889 | 3889 | 0 | 24 | none | 0 |
+| canvas.txt | 0% | 0% | 0% | 4.6532 | 3603.48 | 256587 | 256587 | 256587 | 680 | 680 | 0 | 30 | none | 0 |
+| Day | 0% | 0% | 0% | 48.1744 | 86401.1 | 481258 | 481258 | 481258 | 0 | 0 | 0 | 4 | none | 0 |
+| Gentler_Hour | 0% | 0% | 0% | 4.61681 | 3603.48 | 46550 | 46550 | 46550 | 159 | 159 | 0 | 27 | none | 0 |
+| Input | 0% | 0% | 0.440529% | 0.0124406 | 17.46 | 865 | 865 | 865 | 53 | 1435 | 0 | 16 | none | 1382 |
+| Match_Me_If_You_Can | 0% | 0% | 0% | 0.0457817 | 18.84 | 4088 | 4088 | 4088 | 1964 | 1964 | 0 | 40 | none | 0 |
+| Nice_and_Smooth | 0% | 0% | 0% | 0.0110282 | 16.32 | 82 | 82 | 82 | 0 | 0 | 0 | 1 | none | 0 |
+| Spikey_Mean | 0% | 21.9512% | 0% | 0.0250182 | 28.02 | 4088 | 4088 | 4088 | 3923 | 3923 | 0 | 16 | none | 0 |
+| SpikeyNefarious | 0% | 0% | 0% | 0.0116119 | 16.32 | 712 | 712 | 712 | 0 | 0 | 0 | 16 | none | 0 |
+| Tall_Short | 37.7683% | 41.4634% | 0% | 0.0353243 | 34.8 | 4088 | 4088 | 4088 | 3894 | 3894 | 0 | 24 | none | 0 |
+
+## Run J Log References
+
+- tmp/run_logs/runv_Big_Small_20260404_015813.log
+- tmp/run_logs/runv_canvas.txt_20260404_015813.log
+- tmp/run_logs/runv_Day_20260404_015813.log
+- tmp/run_logs/runv_Gentler_Hour_20260404_015813.log
+- tmp/run_logs/runv_Input_20260404_015813.log
+- tmp/run_logs/runv_Match_Me_If_You_Can_20260404_015813.log
+- tmp/run_logs/runv_Nice_and_Smooth_20260404_015813.log
+- tmp/run_logs/runv_Spikey_Mean_20260404_015813.log
+- tmp/run_logs/runv_SpikeyNefarious_20260404_015813.log
+- tmp/run_logs/runv_Tall_Short_20260404_015813.log
 
 ## Run I Log References
 
