@@ -3,7 +3,6 @@
 
 #include <array>
 #include <cstdint>
-#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -36,8 +35,6 @@ private:
     void ProtectMachine(MachineId_t machine_id, Time_t now);
     bool IsMachineProtected(MachineId_t machine_id, Time_t now) const;
     void MaybeSleepMachine(MachineId_t machine_id, Time_t now);
-    bool TryRelieveMachineOverload(MachineId_t machine_id, Time_t now);
-    void MaybeRelieveOverload(Time_t now);
     void RetryWaitingTasks(Time_t now);
     unsigned CountReadyMachines(CPUType_t cpu_type, MachineId_t exclude_machine) const;
     unsigned CountReadyPreferredMachines(CPUType_t cpu_type, MachineId_t exclude_machine) const;
@@ -50,9 +47,6 @@ private:
     unordered_map<VMId_t, SLAType_t> vm_slas;
     unordered_map<CPUType_t, uint64_t> best_capacity_by_cpu;
     unordered_map<MachineId_t, array<unsigned, NUM_SLAS>> machine_sla_vm_counts;
-    unordered_set<VMId_t> migrating_vms;
-    unordered_map<VMId_t, MachineId_t> migration_sources;
-    unordered_map<VMId_t, MachineId_t> migration_destinations;
     unordered_set<MachineId_t> pending_state_changes;
     unordered_map<MachineId_t, HostState> host_states;
     unordered_map<MachineId_t, Time_t> protected_until;

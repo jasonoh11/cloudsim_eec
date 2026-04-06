@@ -17,7 +17,6 @@ namespace {
 
 constexpr double kOverloadThreshold = 0.80;
 constexpr double kUnderloadThreshold = 0.25;
-constexpr double kMigrationTriggerThreshold = 1.00;
 constexpr unsigned kMinReadyMachinesPerCpu = 3;
 constexpr unsigned kMinReadyPreferredMachinesPerCpu = 8;
 constexpr unsigned kMinReadyGpuMachinesPerCpu = 4;
@@ -34,46 +33,11 @@ uint64_t MachineCapacityScore(MachineId_t machine_id) {
     return static_cast<uint64_t>(machine_info.num_cpus) * base_mips;
 }
 
-unsigned EstimatedVmMemory(VMId_t vm_id) {
-    VMInfo_t vm_info = VM_GetInfo(vm_id);
-    unsigned total_memory = VM_MEMORY_OVERHEAD;
-    for(TaskId_t task_id : vm_info.active_tasks) {
-        total_memory += GetTaskMemory(task_id);
-    }
-    return total_memory;
-}
-
 double MachineLoadScore(MachineId_t machine_id) {
     MachineInfo_t machine_info = Machine_GetInfo(machine_id);
     double task_pressure = static_cast<double>(machine_info.active_tasks) /
                            std::max(1u, machine_info.num_cpus);
     double memory_pressure = static_cast<double>(machine_info.memory_used) /
-                             std::max(1u, machine_info.memory_size);
-    return std::max(task_pressure, memory_pressure);
-}
-
-double ProjectedLoadAfterAddingVm(MachineId_t machine_id, VMId_t vm_id) {
-    MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-    VMInfo_t vm_info = VM_GetInfo(vm_id);
-    unsigned vm_memory = EstimatedVmMemory(vm_id);
-    double projected_tasks = static_cast<double>(machine_info.active_tasks + vm_info.active_tasks.size()) /
-                             std::max(1u, machine_info.num_cpus);
-    double projected_memory = static_cast<double>(machine_info.memory_used + vm_memory) /
-                              std::max(1u, machine_info.memory_size);
-    return std::max(projected_tasks, projected_memory);
-}
-
-double ProjectedLoadAfterRemovingVm(MachineId_t machine_id, VMId_t vm_id) {
-    MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-    VMInfo_t vm_info = VM_GetInfo(vm_id);
-    unsigned vm_memory = EstimatedVmMemory(vm_id);
-    unsigned remaining_tasks = machine_info.active_tasks > vm_info.active_tasks.size() ?
-                               machine_info.active_tasks - static_cast<unsigned>(vm_info.active_tasks.size()) : 0;
-    unsigned remaining_memory = machine_info.memory_used > vm_memory ?
-                                machine_info.memory_used - vm_memory : 0;
-    double task_pressure = static_cast<double>(remaining_tasks) /
-                           std::max(1u, machine_info.num_cpus);
-    double memory_pressure = static_cast<double>(remaining_memory) /
                              std::max(1u, machine_info.memory_size);
     return std::max(task_pressure, memory_pressure);
 }
@@ -287,8 +251,7 @@ bool Scheduler::TryPlaceTask(TaskId_t task_id, bool log_failure) {
         auto vm_sla_it = vm_slas.find(vm_id);
         if(vm_info.cpu != required_cpu ||
            vm_info.vm_type != required_vm ||
-           (vm_sla_it != vm_slas.end() && vm_sla_it->second != required_sla) ||
-           migrating_vms.count(vm_id) != 0) {
+           (vm_sla_it != vm_slas.end() && vm_sla_it->second != required_sla)) {
             continue;
         }
         MachineId_t machine_id = vm_info.machine_id;
@@ -556,13 +519,6 @@ void Scheduler::MaybeSleepMachine(MachineId_t machine_id, Time_t now) {
         idle_since.erase(machine_id);
         return;
     }
-    for(const auto & destination_entry : migration_destinations) {
-        if(destination_entry.second == machine_id) {
-            idle_since.erase(machine_id);
-            return;
-        }
-    }
-
     MachineInfo_t machine_info = Machine_GetInfo(machine_id);
     bool is_preferred = IsPreferredMachineForCpu(best_capacity_by_cpu, machine_info);
     if(machine_info.active_tasks != 0 || machine_info.active_vms != 0) {
@@ -665,126 +621,6 @@ void Scheduler::RetryWaitingTasks(Time_t now) {
     }
 }
 
-bool Scheduler::TryRelieveMachineOverload(MachineId_t best_source, Time_t now) {
-    (void)best_source;
-    (void)now;
-    return false;
-
-    if(!migrating_vms.empty()) {
-        return false;
-    }
-
-    if(best_source == numeric_limits<MachineId_t>::max() ||
-       IsMachineProtected(best_source, now)) {
-        return false;
-    }
-
-    double best_source_load = MachineLoadScore(best_source);
-
-    VMId_t best_vm = numeric_limits<VMId_t>::max();
-    MachineId_t best_destination = numeric_limits<MachineId_t>::max();
-    double best_reduced_load = best_source_load;
-    double best_destination_load = numeric_limits<double>::max();
-    unsigned best_vm_memory = numeric_limits<unsigned>::max();
-
-    for(VMId_t vm_id : vms) {
-        if(migrating_vms.count(vm_id) != 0) {
-            continue;
-        }
-
-        VMInfo_t vm_info = VM_GetInfo(vm_id);
-        if(vm_info.machine_id != best_source || vm_info.active_tasks.empty()) {
-            continue;
-        }
-
-        double reduced_source_load = ProjectedLoadAfterRemovingVm(best_source, vm_id);
-        if(reduced_source_load >= best_source_load) {
-            continue;
-        }
-
-        unsigned vm_memory = EstimatedVmMemory(vm_id);
-        MachineId_t candidate_destination = numeric_limits<MachineId_t>::max();
-        double candidate_destination_load = numeric_limits<double>::max();
-
-        for(MachineId_t machine_id : machines) {
-            if(machine_id == best_source) {
-                continue;
-            }
-
-            MachineInfo_t machine_info = Machine_GetInfo(machine_id);
-            if(machine_info.cpu != vm_info.cpu ||
-               !IsMachineReady(machine_id) ||
-               host_states[machine_id] == HostState::OVERLOADED ||
-               IsMachineProtected(machine_id, now) ||
-               machine_info.memory_used + vm_memory > machine_info.memory_size) {
-                continue;
-            }
-
-            double projected_destination_load = ProjectedLoadAfterAddingVm(machine_id, vm_id);
-            if(projected_destination_load >= kOverloadThreshold) {
-                continue;
-            }
-
-            if(projected_destination_load < candidate_destination_load) {
-                candidate_destination_load = projected_destination_load;
-                candidate_destination = machine_id;
-            }
-        }
-
-        if(candidate_destination == numeric_limits<MachineId_t>::max()) {
-            continue;
-        }
-
-        if(reduced_source_load < best_reduced_load ||
-           (reduced_source_load == best_reduced_load && candidate_destination_load < best_destination_load) ||
-           (reduced_source_load == best_reduced_load && candidate_destination_load == best_destination_load &&
-            vm_memory < best_vm_memory)) {
-            best_reduced_load = reduced_source_load;
-            best_destination_load = candidate_destination_load;
-            best_vm_memory = vm_memory;
-            best_vm = vm_id;
-            best_destination = candidate_destination;
-        }
-    }
-
-    if(best_vm == numeric_limits<VMId_t>::max()) {
-        return false;
-    }
-
-    migrating_vms.insert(best_vm);
-    migration_sources[best_vm] = best_source;
-    migration_destinations[best_vm] = best_destination;
-    VM_Migrate(best_vm, best_destination);
-    SimOutput("Scheduler::MaybeRelieveOverload(): migrating VM " + to_string(best_vm) +
-              " from machine " + to_string(best_source) +
-              " to machine " + to_string(best_destination) +
-              " source_load=" + to_string(best_source_load) +
-              " reduced_load=" + to_string(best_reduced_load), 1);
-    return true;
-}
-
-void Scheduler::MaybeRelieveOverload(Time_t now) {
-    (void)now;
-    return;
-
-    MachineId_t best_source = numeric_limits<MachineId_t>::max();
-    double best_source_load = kMigrationTriggerThreshold;
-    for(MachineId_t machine_id : machines) {
-        double source_load = MachineLoadScore(machine_id);
-        if(host_states[machine_id] != HostState::OVERLOADED ||
-           source_load < kMigrationTriggerThreshold ||
-           IsMachineProtected(machine_id, now)) {
-            continue;
-        }
-        if(source_load > best_source_load) {
-            best_source_load = source_load;
-            best_source = machine_id;
-        }
-    }
-
-    TryRelieveMachineOverload(best_source, now);
-}
-
 void Scheduler::Init() {
     unsigned total_machines = Machine_GetTotal();
     total_tasks = GetNumTasks();
@@ -811,45 +647,8 @@ void Scheduler::Init() {
 }
 
 void Scheduler::MigrationComplete(Time_t time, VMId_t vm_id) {
-    auto source_it = migration_sources.find(vm_id);
-    auto destination_it = migration_destinations.find(vm_id);
-    auto vm_sla_it = vm_slas.find(vm_id);
-
-    if(source_it != migration_sources.end() &&
-       destination_it != migration_destinations.end() &&
-       vm_sla_it != vm_slas.end()) {
-        SLAType_t vm_sla = vm_sla_it->second;
-        if(machine_sla_vm_counts[source_it->second][vm_sla] > 0) {
-            machine_sla_vm_counts[source_it->second][vm_sla]--;
-        }
-        machine_sla_vm_counts[destination_it->second][vm_sla]++;
-        idle_since.erase(destination_it->second);
-        low_power_since.erase(destination_it->second);
-    }
-
-    migrating_vms.erase(vm_id);
-    migration_sources.erase(vm_id);
-    migration_destinations.erase(vm_id);
-
-    if(find(vms.begin(), vms.end(), vm_id) != vms.end()) {
-        VMInfo_t vm_info = VM_GetInfo(vm_id);
-        if(vm_info.active_tasks.empty()) {
-            if(vm_sla_it != vm_slas.end()) {
-                auto machine_counts_it = machine_sla_vm_counts.find(vm_info.machine_id);
-                if(machine_counts_it != machine_sla_vm_counts.end() &&
-                   machine_counts_it->second[vm_sla_it->second] > 0) {
-                    machine_counts_it->second[vm_sla_it->second]--;
-                }
-            }
-            VM_Shutdown(vm_id);
-            vms.erase(remove(vms.begin(), vms.end(), vm_id), vms.end());
-            vm_slas.erase(vm_id);
-        }
-    }
-
-    RefreshMachineStates();
-    MaybeRelieveOverload(time);
-    RetryWaitingTasks(time);
+    (void)time;
+    (void)vm_id;
 }
 
 void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
@@ -864,7 +663,6 @@ void Scheduler::NewTask(Time_t now, TaskId_t task_id) {
 
 void Scheduler::PeriodicCheck(Time_t now) {
     RefreshMachineStates();
-    MaybeRelieveOverload(now);
     for(MachineId_t machine_id : machines) {
         MaybeSleepMachine(machine_id, now);
     }
@@ -906,12 +704,6 @@ void Scheduler::TaskComplete(Time_t now, TaskId_t task_id) {
 
         VMInfo_t vm_info = VM_GetInfo(vm_id);
         if(vm_info.active_tasks.empty()) {
-            if(migrating_vms.count(vm_id) != 0) {
-                RetryWaitingTasks(now);
-                SimOutput("Scheduler::TaskComplete(): VM " + to_string(vm_id) +
-                          " is empty but still migrating, deferring shutdown", 2);
-                return;
-            }
             for(auto it = task_to_vm.begin(); it != task_to_vm.end(); ) {
                 if(it->second == vm_id) {
                     it = task_to_vm.erase(it);
