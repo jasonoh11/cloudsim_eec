@@ -666,6 +666,10 @@ void Scheduler::RetryWaitingTasks(Time_t now) {
 }
 
 bool Scheduler::TryRelieveMachineOverload(MachineId_t best_source, Time_t now) {
+    (void)best_source;
+    (void)now;
+    return false;
+
     if(!migrating_vms.empty()) {
         return false;
     }
@@ -760,6 +764,9 @@ bool Scheduler::TryRelieveMachineOverload(MachineId_t best_source, Time_t now) {
 }
 
 void Scheduler::MaybeRelieveOverload(Time_t now) {
+    (void)now;
+    return;
+
     MachineId_t best_source = numeric_limits<MachineId_t>::max();
     double best_source_load = kMigrationTriggerThreshold;
     for(MachineId_t machine_id : machines) {
@@ -964,17 +971,8 @@ void Scheduler::HandleSLAWarning(Time_t time, TaskId_t task_id) {
 
 void Scheduler::HandleMemoryWarning(Time_t time, MachineId_t machine_id) {
     ProtectMachine(machine_id, time);
-    RefreshMachineStates();
-
-    if(TryRelieveMachineOverload(machine_id, time)) {
-        SimOutput("Scheduler::HandleMemoryWarning(): triggered overload relief for machine " +
-                  to_string(machine_id) + " at time " + to_string(time), 1);
-    } else {
-        SimOutput("Scheduler::HandleMemoryWarning(): no safe migration found for machine " +
-                  to_string(machine_id) + " at time " + to_string(time), 2);
-    }
-
-    RetryWaitingTasks(time);
+    SimOutput("MemoryWarning(): Overflow at " + to_string(machine_id) +
+              " was detected at time " + to_string(time), 0);
 }
 
 static Scheduler Scheduler;
